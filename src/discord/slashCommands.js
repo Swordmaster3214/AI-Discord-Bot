@@ -21,6 +21,16 @@ const { REASONING_BUTTON_ID, storeThinking, getThinking } = require("../tools/ch
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 
+// Maps subcommand name → { configKey, label, ownerOnlyInDms }
+const TOGGLE_SUBCOMMANDS = {
+    exec:     { key: "execEnabled",     label: "Exec",          ownerOnlyInDms: true  },
+    browsing: { key: "browsingEnabled", label: "Web search",    ownerOnlyInDms: true  },
+    thinking: { key: "thinkingEnabled", label: "Thinking",      ownerOnlyInDms: false },
+    file:     { key: "fileEnabled",     label: "File access",   ownerOnlyInDms: true  },
+    runcode:  { key: "runCodeEnabled",  label: "Code execution",ownerOnlyInDms: true  },
+    fetch:    { key: "fetchEnabled",    label: "Page fetch",    ownerOnlyInDms: true  },
+};
+
 // ── Command builders ──────────────────────────────────────────────────────────
 function buildCommands() {
     return [
@@ -70,6 +80,24 @@ function buildCommands() {
         .addSubcommand(c => c
         .setName("thinking")
         .setDescription("Enable or disable native chain-of-thought thinking for the model")
+        .addBooleanOption(o => o.setName("value").setDescription("Enable or disable").setRequired(true))
+        .addChannelOption(o => o.setName("channel").setDescription("Channel to configure"))
+        .addUserOption(o => o.setName("user").setDescription("Configure another user's DMs (owner only)")))
+        .addSubcommand(c => c
+        .setName("file")
+        .setDescription("Enable or disable sandboxed file access — DMs: owner only")
+        .addBooleanOption(o => o.setName("value").setDescription("Enable or disable").setRequired(true))
+        .addChannelOption(o => o.setName("channel").setDescription("Channel to configure"))
+        .addUserOption(o => o.setName("user").setDescription("Configure another user's DMs (owner only)")))
+        .addSubcommand(c => c
+        .setName("runcode")
+        .setDescription("Enable or disable code execution — DMs: owner only")
+        .addBooleanOption(o => o.setName("value").setDescription("Enable or disable").setRequired(true))
+        .addChannelOption(o => o.setName("channel").setDescription("Channel to configure"))
+        .addUserOption(o => o.setName("user").setDescription("Configure another user's DMs (owner only)")))
+        .addSubcommand(c => c
+        .setName("fetch")
+        .setDescription("Enable or disable page fetching — DMs: owner only")
         .addBooleanOption(o => o.setName("value").setDescription("Enable or disable").setRequired(true))
         .addChannelOption(o => o.setName("channel").setDescription("Channel to configure"))
         .addUserOption(o => o.setName("user").setDescription("Configure another user's DMs (owner only)")))
@@ -178,15 +206,14 @@ async function register(client) {
 // ── Handler helpers ───────────────────────────────────────────────────────────
 function getInteractionContext(interaction) {
     return {
-        guildId:        interaction.guildId ?? null,
-        channelId:      interaction.channelId,
-        userId:         interaction.user.id,
-        isGroupDM:      !interaction.guildId && interaction.channel?.type === 9, // GroupDM
+        guildId:         interaction.guildId ?? null,
+        channelId:       interaction.channelId,
+        userId:          interaction.user.id,
+        isGroupDM:       !interaction.guildId && interaction.channel?.type === 9,
         parentChannelId: getParentChannelId(interaction.channel),
     };
 }
 
-// Resolves the target channel/DM for /config subcommands.
 function resolveConfigTarget(interaction, ctx) {
     const { guildId, channelId, isGroupDM } = ctx;
     const targetUser      = interaction.options.getUser("user");
@@ -239,7 +266,6 @@ function handleInteraction(client) {
             const attachment = interaction.options.getAttachment("file");
             await interaction.deferReply();
 
-            // Read optional attachment
             let attachmentText = "";
             let attachmentImages = [];
             if (attachment) {
@@ -366,8 +392,8 @@ function handleInteraction(client) {
                     if (!isOwner(userId) && !hasManageGuild(interaction)) {
                         return interaction.reply({ content: "You need the Manage Server permission to change context scope.", flags: MessageFlags.Ephemeral });
                     }
-                    const value = interaction.options.getString("value");
-                    const guild = getGuildConfig(guildId);
+                    const value    = interaction.options.getString("value");
+                    const guild    = getGuildConfig(guildId);
                     const oldScope = guild.contextScope ?? "local";
                     guild.contextScope = value;
                     saveConfig(config);
@@ -419,17 +445,14 @@ function handleInteraction(client) {
                 return interaction.reply({ content: `✅ Gaslight permission set to \`${value}\`.` });
             }
 
-            // mode / exec / browsing / thinking
-            if (["mode", "exec", "browsing", "thinking"].includes(sub)) {
+            // ── Toggle subcommands (mode + all boolean tool flags) ─────────────
+            if (sub === "mode" || sub in TOGGLE_SUBCOMMANDS) {
                 if (guildId && !isOwner(userId) && !hasManageGuild(interaction)) {
                     return interaction.reply({ content: "You need the Manage Server permission to configure the bot.", flags: MessageFlags.Ephemeral });
                 }
                 const { targetUser, targetChannelId, targetDmUserId, targetMention } = resolveConfigTarget(interaction, ctx);
                 if (targetUser && !isOwner(userId)) {
                     return interaction.reply({ content: "Only the bot owner can configure another user's DMs.", flags: MessageFlags.Ephemeral });
-                }
-                if (["exec", "browsing"].includes(sub) && !guildId && !isOwner(userId)) {
-                    return interaction.reply({ content: "Only the bot owner can enable exec or browsing in DMs.", flags: MessageFlags.Ephemeral });
                 }
 
                 if (sub === "mode") {
@@ -438,11 +461,15 @@ function handleInteraction(client) {
                     else         setChannelConfig(null, channelId, "mode", value, targetDmUserId, isGroupDM);
                     return interaction.reply({ content: `✅ Mode for ${targetMention} set to \`${value}\`.` });
                 }
-                const key   = sub === "exec" ? "execEnabled" : sub === "browsing" ? "browsingEnabled" : "thinkingEnabled";
+
+                // All remaining toggle subcommands share the same shape.
+                const { key, label, ownerOnlyInDms } = TOGGLE_SUBCOMMANDS[sub];
+                if (ownerOnlyInDms && !guildId && !isOwner(userId)) {
+                    return interaction.reply({ content: `Only the bot owner can enable ${label} in DMs.`, flags: MessageFlags.Ephemeral });
+                }
                 const value = interaction.options.getBoolean("value");
                 if (guildId) setChannelConfig(guildId, targetChannelId, key, value);
                 else         setChannelConfig(null, channelId, key, value, targetDmUserId, isGroupDM);
-                const label = sub === "exec" ? "Exec" : sub === "browsing" ? "Web search" : "Thinking";
                 return interaction.reply({ content: `✅ ${label} for ${targetMention} ${value ? "enabled" : "disabled"}.` });
             }
 
@@ -515,25 +542,26 @@ function handleInteraction(client) {
             }
 
             // sub === "info"
-            const channelConfig = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
-            const guildConf     = guildId ? getGuildConfig(guildId) : null;
-            const modelDisplay  = guildId
+            const channelConfig      = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
+            const guildConf          = guildId ? getGuildConfig(guildId) : null;
+            const modelDisplay       = guildId
             ? (guildConf.model ?? DEFAULT_MODEL)
             : isGroupDM
             ? (config.groupDms[channelId]?.model ?? DEFAULT_MODEL)
             : (config.dms[userId]?.model ?? DEFAULT_MODEL);
-            const timeoutDisplay   = config.ollamaTimeout === 0 ? "none" : `${config.ollamaTimeout / 1000}s`;
-            const clearPermDisplay = guildId
+            const timeoutDisplay     = config.ollamaTimeout === 0 ? "none" : `${config.ollamaTimeout / 1000}s`;
+            const clearPermDisplay   = guildId
             ? (guildConf.channels[channelId]?.clearPermission ?? guildConf.clearPermission ?? "everyone")
             : "everyone";
             const gaslightPermDisplay = guildId ? (guildConf.gaslightPermission ?? "manager") : "owner only";
-            const scopeDisplay = guildConf ? (guildConf.contextScope ?? "local") : "local";
+            const scopeDisplay        = guildConf ? (guildConf.contextScope ?? "local") : "local";
 
             const msg = [
                 "🤖 **Help**", "",
                 "**── This location ──**",
-                `Mode: \`${channelConfig.mode}\` | Exec: \`${channelConfig.execEnabled}\` | Browsing: \`${channelConfig.browsingEnabled}\` | Thinking: \`${channelConfig.thinkingEnabled ?? false}\` | Clear: \`${clearPermDisplay}\` | Gaslight: \`${gaslightPermDisplay}\``,
-                `Context scope: \`${scopeDisplay}\``,
+                `Mode: \`${channelConfig.mode}\` | Exec: \`${channelConfig.execEnabled}\` | Browsing: \`${channelConfig.browsingEnabled}\` | Thinking: \`${channelConfig.thinkingEnabled ?? false}\``,
+                `File: \`${channelConfig.fileEnabled ?? false}\` | Run code: \`${channelConfig.runCodeEnabled ?? false}\` | Fetch: \`${channelConfig.fetchEnabled ?? false}\``,
+                `Clear: \`${clearPermDisplay}\` | Gaslight: \`${gaslightPermDisplay}\` | Context scope: \`${scopeDisplay}\``,
                 "",
                 "**── Global ──**",
                 `Model: \`${modelDisplay}\` | Timeout: \`${timeoutDisplay}\``,
@@ -551,6 +579,9 @@ function handleInteraction(client) {
               "/config exec <value> [channel] [user] *(DMs: owner only)*",
               "/config browsing <value> [channel] [user] *(DMs: owner only)*",
               "/config thinking <value> [channel] [user]",
+              "/config file <value> [channel] [user] *(DMs: owner only)*",
+              "/config runcode <value> [channel] [user] *(DMs: owner only)*",
+              "/config fetch <value> [channel] [user] *(DMs: owner only)*",
               "/config model set <n> → Set model *(server: permission-dependent; DM: anyone)*",
               "/config model permission <value> → Who can change model *(ManageServer or owner)*",
               "/config timeout <seconds> *(owner only)*",
@@ -593,16 +624,17 @@ function handleInteraction(client) {
             ? "guild-wide" : "this channel's";
             return interaction.reply({ content: `✅ Cleared ${scopeLabel} AI context.` });
         }
+
         // ── /gaslight ─────────────────────────────────────────────────────────
         if (commandName === "gaslight") {
             if (!canGaslight(interaction, guildId)) {
                 return interaction.reply({ content: "You don't have permission to use `/gaslight` here.", flags: MessageFlags.Ephemeral });
             }
 
-            const content       = interaction.options.getString("content");
-            const useEphemeral  = interaction.options.getBoolean("ephemeral") ?? true;
-            const doAnnounce    = interaction.options.getBoolean("announce") ?? false;
-            const replyFlags    = useEphemeral ? MessageFlags.Ephemeral : undefined;
+            const content      = interaction.options.getString("content");
+            const useEphemeral = interaction.options.getBoolean("ephemeral") ?? true;
+            const doAnnounce   = interaction.options.getBoolean("announce") ?? false;
+            const replyFlags   = useEphemeral ? MessageFlags.Ephemeral : undefined;
 
             const channelConfig = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
             const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM);
@@ -653,7 +685,7 @@ function handleInteraction(client) {
             }
 
             if (sub === "list") {
-                const mems = memory.getMemories(userId);
+                const mems    = memory.getMemories(userId);
                 const enabled = memory.isUserEnabled(userId);
                 if (mems.length === 0) {
                     return interaction.reply({
@@ -663,14 +695,11 @@ function handleInteraction(client) {
                         flags: MessageFlags.Ephemeral,
                     });
                 }
-                const lines = mems.map(m => {
+                const lines  = mems.map(m => {
                     const date = new Date(m.created_at).toISOString().slice(0, 10);
                     return `\`#${m.id}\` [${date}] ${m.fact}`;
                 }).join("\n");
-                const chunks = splitMessage(
-                    `**Your memories (${mems.length}/50):**\n${lines}`,
-                                            1900,
-                );
+                const chunks = splitMessage(`**Your memories (${mems.length}/50):**\n${lines}`, 1900);
                 await interaction.reply({ content: chunks[0], flags: MessageFlags.Ephemeral });
                 for (let i = 1; i < chunks.length; i++) {
                     await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
@@ -694,7 +723,7 @@ function handleInteraction(client) {
                         flags: MessageFlags.Ephemeral,
                     });
                 }
-                const fact = interaction.options.getString("fact").trim().slice(0, 200);
+                const fact   = interaction.options.getString("fact").trim().slice(0, 200);
                 const result = memory.addMemory(userId, fact);
                 const evictNote = result.evictedId ? ` (oldest memory #${result.evictedId} evicted — limit 50)` : "";
                 console.log(`[MEMORY] User ${userId} manually added memory #${result.id}`);
@@ -705,7 +734,7 @@ function handleInteraction(client) {
             }
 
             if (sub === "delete") {
-                const id = interaction.options.getInteger("id");
+                const id      = interaction.options.getInteger("id");
                 const deleted = memory.deleteMemory(userId, id);
                 if (!deleted) {
                     return interaction.reply({

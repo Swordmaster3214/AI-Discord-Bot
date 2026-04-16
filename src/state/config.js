@@ -15,6 +15,9 @@ const defaultConfig = {
         execEnabled:     false,
         browsingEnabled: false,
         thinkingEnabled: false,
+        fileEnabled:     false,
+        runCodeEnabled:  true,
+        fetchEnabled:    false,
     },
     // guilds: { [guildId]: {
     //   contextScope: "local"|"global",
@@ -36,6 +39,9 @@ function backfillChannelEntry(ch) {
     if (ch.execEnabled     === undefined) ch.execEnabled     = d.execEnabled;
     if (ch.browsingEnabled === undefined) ch.browsingEnabled = d.browsingEnabled;
     if (ch.thinkingEnabled === undefined) ch.thinkingEnabled = d.thinkingEnabled;
+    if (ch.fileEnabled    === undefined) ch.fileEnabled    = d.fileEnabled;
+    if (ch.runCodeEnabled === undefined) ch.runCodeEnabled = d.runCodeEnabled;
+    if (ch.fetchEnabled   === undefined) ch.fetchEnabled   = d.fetchEnabled;
 }
 
 function loadConfig() {

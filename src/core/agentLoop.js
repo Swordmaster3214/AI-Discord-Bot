@@ -5,19 +5,34 @@ const execTool       = require("../tools/exec");
 const searchTool     = require("../tools/search");
 const memoryTools    = require("../tools/memoryTools");
 const memory         = require("../state/memory");
+const fileTool       = require("../tools/file");
+const runCodeTool    = require("../tools/runCode");
+const fetchTool      = require("../tools/fetch");
 
 const MAX_ITERATIONS = 10;
 
+// ── Tool registry ─────────────────────────────────────────────────────────────
+// Add new tools here only. No other changes needed to support them.
+const TOOLS = {
+    exec:       { def: execTool.definition,              exec: (args, ctx)        => execTool.execute(args, ctx) },
+    search:     { def: searchTool.definition,            exec: (args)             => searchTool.execute(args) },
+    remember:   { def: memoryTools.rememberDefinition,   exec: (args, _ctx, uid)  => memoryTools.executeRemember(args, uid) },
+    forget:     { def: memoryTools.forgetDefinition,     exec: (args, _ctx, uid)  => memoryTools.executeForget(args, uid) },
+        file:       { def: fileTool.definition,              exec: (args)             => fileTool.execute(args) },
+        run_code:   { def: runCodeTool.definition,           exec: (args)             => runCodeTool.execute(args) },
+        fetch_page: { def: fetchTool.definition,             exec: (args)             => fetchTool.execute(args) },
+};
+
 // Builds the tools array for Ollama based on channel config and memory opt-in.
 function buildToolDefinitions(channelConfig, execAllowed, userId) {
-    const tools = [];
-    if (execAllowed && channelConfig.execEnabled)   tools.push(execTool.definition);
-    if (channelConfig.browsingEnabled)               tools.push(searchTool.definition);
-    if (memory.ENABLED && userId && memory.isUserEnabled(userId)) {
-        tools.push(memoryTools.rememberDefinition);
-        tools.push(memoryTools.forgetDefinition);
-    }
-    return tools;
+    const enabled = [];
+    if (execAllowed && channelConfig.execEnabled)                 enabled.push("exec");
+    if (channelConfig.browsingEnabled)                            enabled.push("search");
+    if (channelConfig.fileEnabled)                                enabled.push("file");
+    if (channelConfig.runCodeEnabled)                             enabled.push("run_code");
+    if (channelConfig.fetchEnabled)                               enabled.push("fetch_page");
+    if (memory.ENABLED && userId && memory.isUserEnabled(userId)) enabled.push("remember", "forget");
+    return enabled.map(k => TOOLS[k].def);
 }
 
 // Splits a string into Discord-safe chunks (≤2000 chars).
@@ -136,29 +151,27 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
             const args = call.function?.arguments ?? {};
             console.log(`[AGENT] Tool call: ${name}`, args);
 
+            const tool = TOOLS[name];
+            if (!tool) {
+                console.warn(`[AGENT] Unknown tool: ${name}`);
+                messages.push({ role: "tool", content: `Unknown tool "${name}".` });
+                continue;
+            }
+
             let toolResult;
 
             if (name === "exec") {
                 if (!execAllowed) {
                     toolResult = "Exec is disabled — command was not run.";
                 } else {
-                    const { result, isDenied } = await execTool.execute(args, {
-                        replyFn, typing, messages, meta, client,
-                    });
+                    const { result, isDenied } = await tool.exec(args, { replyFn, typing, messages, meta, client });
                     if (isDenied) execAllowed = false;
                     toolResult = isDenied
                     ? `Denied: ${result}. Do not retry this command or suggest alternatives.`
                     : result;
                 }
-            } else if (name === "search") {
-                toolResult = await searchTool.execute(args);
-            } else if (name === "remember") {
-                toolResult = memoryTools.executeRemember(args, userId);
-            } else if (name === "forget") {
-                toolResult = memoryTools.executeForget(args, userId);
             } else {
-                console.warn(`[AGENT] Unknown tool: ${name}`);
-                toolResult = `Unknown tool "${name}".`;
+                toolResult = await tool.exec(args, null, userId);
             }
 
             messages.push({ role: "tool", content: toolResult });
