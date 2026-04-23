@@ -4,6 +4,7 @@ const { contexts }    = require("../state/contexts");
 const { clearGuildContexts } = require("../state/contexts");
 const { isOwner }     = require("../state/permissions");
 const { splitMessage } = require("../core/queue");
+const { activeGenerations } = require("../core/queue");
 const memory           = require("../state/memory");
 
 const PREFIX = "!";
@@ -21,6 +22,8 @@ async function handle(message, cmd, client) {
             "`!clear guild <guildId>` — clear all contexts for a guild\n" +
             "`!clear dm <userId>` — clear a specific user's DM context\n" +
             "`!clear all` — clear every context in memory\n" +
+            "`!active` — list in-progress generations\n" +
+            "`!kill <contextKey>` — abort a generation by context key\n" +
             "`!exec <command>` — run a shell command on the host machine\n" +
             "`!models` — list available Ollama models\n" +
             "`!model pull <name>` — pull a model\n" +
@@ -93,6 +96,26 @@ async function handle(message, cmd, client) {
             return message.reply(`✅ Cleared DM context for \`${uid}\`.`);
         }
         return message.reply("Usage: `!clear all` | `!clear guild <guildId>` | `!clear dm <userId>`");
+    }
+
+    if (command === "active") {
+        if (activeGenerations.size === 0) return message.reply("No generations currently running.");
+        const lines = [...activeGenerations.entries()].map(([key, g]) => {
+            const elapsed = ((Date.now() - g.startedAt) / 1000).toFixed(1);
+            return `\`${key}\` — ${g.username} — ${elapsed}s elapsed`;
+        });
+        return message.reply(`**Active generations (${activeGenerations.size}):**\n${lines.join("\n")}`);
+    }
+
+    if (command === "kill") {
+        const key = parts[1];
+        if (!key) return message.reply("Usage: `!kill <contextKey>`");
+        const gen = activeGenerations.get(key);
+        if (!gen) return message.reply(`No active generation for \`${key}\`.`);
+        gen.controller.abort();
+        const elapsed = ((Date.now() - gen.startedAt) / 1000).toFixed(1);
+        console.log(`[OWNER] Killed generation for ${key} (${gen.username}, ${elapsed}s elapsed).`);
+        return message.reply(`⛔ Killed \`${key}\` (${gen.username}, was running for ${elapsed}s).`);
     }
 
     if (command === "exec") {

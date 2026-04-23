@@ -97,7 +97,7 @@ function splitMessage(text, size = 2000) {
 // Runs the conversation loop, dispatching tool_calls until the model produces
 // a plain content response (no tool_calls).
 // Returns { reply: string, thinking: string, memoriesInjected: bool }
-async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, client, userId) {
+async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, client, userId, signal = null) {
     let execAllowed = channelConfig.execEnabled;
     const thinkingEnabled = channelConfig.thinkingEnabled ?? false;
     const model = meta.model ?? process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
@@ -112,8 +112,14 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
         const tools = buildToolDefinitions(channelConfig, execAllowed, userId);
         let response;
         try {
-            response = await ollamaChat({ model, messages, tools, thinkingEnabled, client });
+            response = await ollamaChat({ model, messages, tools, thinkingEnabled, client, signal });
         } catch (err) {
+            // User (or owner/admin) killed the generation.
+            if (err.code === "ERR_CANCELED") {
+                console.log("[AGENT] Generation aborted by kill signal.");
+                typing.stop();
+                return { reply: "⛔ Generation stopped.", thinking: accumulatedThinking, memoriesInjected: false };
+            }
             console.error(`[AGENT] Ollama error: ${err.message}`);
             typing.stop();
             return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
@@ -184,7 +190,7 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
 }
 
 // ── Trigger entry point ───────────────────────────────────────────────────────
-async function handleTrigger(content, replyFn, typing, channelConfig, contextKey, username, sourceMeta = {}, images = [], client, userId) {
+async function handleTrigger(content, replyFn, typing, channelConfig, contextKey, username, sourceMeta = {}, images = [], client, userId, signal = null) {
     console.log(`[TRIGGER] ${username}: "${content.slice(0, 80)}"`);
     const messages = getContext(contextKey, channelConfig);
     syncSystemPrompt(contextKey, channelConfig);
@@ -203,7 +209,7 @@ async function handleTrigger(content, replyFn, typing, channelConfig, contextKey
     : { role: "user", content: `[${username}]: ${content}` };
     messages.push(userMsg);
 
-    const result = await runAgent(messages, replyFn, typing, channelConfig, sourceMeta, client, userId);
+    const result = await runAgent(messages, replyFn, typing, channelConfig, sourceMeta, client, userId, signal);
 
     // Flag memoriesInjected so callers can suppress the 🧠 button to protect privacy.
     if (memoryBlock) result.memoriesInjected = true;

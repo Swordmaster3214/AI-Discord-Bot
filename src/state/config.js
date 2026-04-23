@@ -16,7 +16,7 @@ const defaultConfig = {
         browsingEnabled: false,
         thinkingEnabled: false,
         fileEnabled:     false,
-        runCodeEnabled:  true,
+        runCodeEnabled:  false,
         fetchEnabled:    false,
     },
     // guilds: { [guildId]: {

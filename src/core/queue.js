@@ -23,6 +23,10 @@ const activeUserContexts = new Set();
 const contextQueues  = new Map();
 const activeContexts = new Set();
 
+// ── Active generation tracking ────────────────────────────────────────────────
+// Map<contextKey, { userId, guildId, username, startedAt, controller }>
+const activeGenerations = new Map();
+
 async function enqueue(job) {
     const key = job.contextKey;
     const userKey = job.userId ? `${job.userId}:${key}` : null;
@@ -75,6 +79,16 @@ async function processContext(key) {
         }
     }
 
+    // Create an AbortController for this generation and register it.
+    const controller = new AbortController();
+    activeGenerations.set(key, {
+        userId:    job.userId,
+        guildId:   job.sourceMeta?.guildId ?? null,
+        username:  job.username,
+        startedAt: Date.now(),
+                          controller,
+    });
+
     await acquireOllamaSlot();
     const channel = await job.getChannel();
     const typing  = startTyping(channel);
@@ -84,6 +98,7 @@ async function processContext(key) {
             job.content, job.replyFn, typing, job.channelConfig,
             job.contextKey, job.username, job.sourceMeta ?? {},
             job.images ?? [], job.client, job.userId,
+            controller.signal,
         );
         if (result) await job.sendResult(result);
     } catch (err) {
@@ -91,6 +106,7 @@ async function processContext(key) {
         console.error(`[QUEUE] Job error on context ${key}: ${err.message}`);
         await job.sendResult({ reply: `❌ An error occurred: ${err.message}`, thinking: "", memoriesInjected: false });
     } finally {
+        activeGenerations.delete(key);
         releaseOllamaSlot();
         if (userKey) activeUserContexts.delete(userKey);
     }
@@ -108,4 +124,4 @@ function startTyping(channel) {
     };
 }
 
-module.exports = { enqueue, startTyping, splitMessage, contextQueues, activeContexts };
+module.exports = { enqueue, startTyping, splitMessage, contextQueues, activeContexts, activeGenerations };

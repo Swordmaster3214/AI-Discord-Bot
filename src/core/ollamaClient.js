@@ -6,7 +6,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 
 // Sends a chat request to Ollama using native tool calling.
 // Falls back on 400 only for unsupported thinking — tools are always sent.
-async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false, client }) {
+async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false, client, signal = null }) {
     const attemptRequest = async (useThinking, useTools) => {
         const body = {
             model,
@@ -18,6 +18,7 @@ async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false
 
         const res = await axios.post(`${OLLAMA_URL}/api/chat`, body, {
             timeout: config.ollamaTimeout,
+            signal,
         });
 
         const msg = res.data.message;
@@ -32,6 +33,9 @@ async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false
     try {
         return await attemptRequest(thinkingEnabled, tools);
     } catch (err) {
+        // Propagate cancellations immediately — don't retry or wrap them.
+        if (err.code === "ERR_CANCELED") throw err;
+
         if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET") {
             throw new Error("Ollama is not running. Start it with `ollama serve` and try again.");
         }

@@ -1,4 +1,4 @@
-const axios = require("axios");
+const puppeteer = require("puppeteer");
 
 const definition = { type: "function", function: {
     name: "fetch_page",
@@ -8,18 +8,34 @@ const definition = { type: "function", function: {
     }, required: ["url"] },
 }};
 
+let browser = null;
+
+async function getBrowser() {
+    if (!browser || !browser.connected) {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        });
+    }
+    return browser;
+}
+
 async function execute({ url }) {
+    const b = await getBrowser();
+    const page = await b.newPage();
     try {
-        const res = await axios.get(url, { timeout: 10000, responseType: "text",
-            headers: { "User-Agent": "Mozilla/5.0" } });
-        // Strip HTML tags, collapse whitespace
-        const text = res.data
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ").trim();
-        return text.slice(0, 6000); // cap at 6k chars
-    } catch(e) { return `Fetch failed: ${e.message}`; }
+        await page.setUserAgent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        );
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+        const text = await page.evaluate(() => document.body.innerText);
+        return text.replace(/\s+/g, " ").trim().slice(0, 6000);
+    } catch (e) {
+        return `Fetch failed: ${e.message}`;
+    } finally {
+        await page.close();
+    }
 }
 
 module.exports = { definition, execute };

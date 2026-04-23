@@ -15,7 +15,7 @@ const {
     isOwner, hasManageGuild, canClearContext, canGaslight, getParentChannelId,
     isChannelAllowed,
 } = require("../state/permissions");
-const { enqueue, splitMessage } = require("../core/queue");
+const { enqueue, splitMessage, activeGenerations } = require("../core/queue");
 const { readTextAttachments, readImageAttachments } = require("../tools/attachments");
 const { REASONING_BUTTON_ID, storeThinking, getThinking } = require("../tools/chainSender");
 
@@ -39,6 +39,14 @@ function buildCommands() {
         .setDescription("Run the AI agent")
         .addStringOption(o => o.setName("prompt").setDescription("Your request").setRequired(true))
         .addAttachmentOption(o => o.setName("file").setDescription("Optional file or image to include")),
+
+        new SlashCommandBuilder()
+        .setName("kill")
+        .setDescription("Stop an in-progress AI generation in this channel")
+        .addStringOption(o => o
+        .setName("context")
+        .setDescription("Context key to kill — owner only, see !active in owner DMs")
+        .setRequired(false)),
 
         new SlashCommandBuilder()
         .setName("approve")
@@ -314,6 +322,45 @@ function handleInteraction(client) {
             return;
         }
 
+        // ── /kill ─────────────────────────────────────────────────────────────
+        if (commandName === "kill") {
+            const targetKey = interaction.options.getString("context");
+
+            // Explicit context key — owner only
+            if (targetKey) {
+                if (!isOwner(userId)) {
+                    return interaction.reply({ content: "Only the bot owner can kill by context key.", flags: MessageFlags.Ephemeral });
+                }
+                const gen = activeGenerations.get(targetKey);
+                if (!gen) return interaction.reply({ content: `No active generation for \`${targetKey}\`.`, flags: MessageFlags.Ephemeral });
+                gen.controller.abort();
+                const elapsed = ((Date.now() - gen.startedAt) / 1000).toFixed(1);
+                console.log(`[KILL] Owner killed generation for ${targetKey} (${gen.username}, ${elapsed}s elapsed).`);
+                return interaction.reply({ content: `⛔ Killed generation for \`${targetKey}\` (started by ${gen.username}, was running for ${elapsed}s).` });
+            }
+
+            // No context key — resolve from current channel
+            const contextKey = getContextKey(guildId, channelId, userId, isGroupDM);
+            const gen = activeGenerations.get(contextKey);
+            if (!gen) {
+                return interaction.reply({ content: "No generation is currently running here.", flags: MessageFlags.Ephemeral });
+            }
+
+            const isAdmin      = isOwner(userId) || hasManageGuild(interaction);
+            const isOwnerOfGen = gen.userId === userId;
+
+            if (!isAdmin && !isOwnerOfGen) {
+                return interaction.reply({ content: "You can only stop your own generation. Server admins and the bot owner can stop any.", flags: MessageFlags.Ephemeral });
+            }
+
+            gen.controller.abort();
+            const elapsed = ((Date.now() - gen.startedAt) / 1000).toFixed(1);
+            console.log(`[KILL] ${interaction.user.username} killed generation for ${contextKey} (${gen.username}, ${elapsed}s elapsed).`);
+            return interaction.reply({
+                content: `⛔ Stopped ${isOwnerOfGen ? "your" : `${gen.username}'s`} generation (was running for ${elapsed}s).`,
+            });
+        }
+
         // ── /approve ──────────────────────────────────────────────────────────
         if (commandName === "approve") {
             if (!isOwner(userId)) {
@@ -571,6 +618,7 @@ function handleInteraction(client) {
               "/help info → Show this message",
               "/help models → List available Ollama models",
               "/agent <prompt> [file] → Run the AI agent",
+              "/kill [context] → Stop an in-progress generation",
               "/approve list → List pending exec requests *(owner only)*",
               "/approve decide <id> <accept|deny> [reason] → Resolve a pending request *(owner only)*",
               "/clearcontext [all] → Clear AI context *(ManageServer or owner)*",
