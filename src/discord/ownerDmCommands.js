@@ -1,13 +1,24 @@
-const { spawnSync }   = require("child_process");
-const { config }      = require("../state/config");
-const { contexts }    = require("../state/contexts");
+const { config }     = require("../state/config");
+const { contexts }   = require("../state/contexts");
 const { clearGuildContexts } = require("../state/contexts");
-const { isOwner }     = require("../state/permissions");
+const { isOwner }    = require("../state/permissions");
 const { splitMessage } = require("../core/queue");
 const { activeGenerations } = require("../core/queue");
-const memory           = require("../state/memory");
+const { runAsync }   = require("./slashCommands/utils");
+const memory         = require("../state/memory");
 
 const PREFIX = "!";
+
+// Strip ANSI escape codes and tidy whitespace from terminal output.
+// Kept here rather than utils.js — only needed for raw terminal output
+// in owner DM commands, not in slash command handlers.
+function stripAnsi(str) {
+    return str
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 async function handle(message, cmd, client) {
     const parts   = cmd.trim().split(/\s+/);
@@ -123,16 +134,16 @@ async function handle(message, cmd, client) {
         if (!shellCmd) return message.reply("Usage: `!exec <command>`");
         console.log(`[OWNER] !exec: ${shellCmd}`);
         try {
-            const result = spawnSync(shellCmd, { shell: true, timeout: 30000, encoding: "utf8" });
-            const stdout = result.stdout?.trim() || "";
-            const stderr = result.stderr?.trim() || "";
+            const result = await runAsync("/bin/sh", ["-c", shellCmd], 30_000);
+            const stdout = stripAnsi(result.stdout);
+            const stderr = stripAnsi(result.stderr);
             const out = [];
+            if (result.timedOut) out.push("⚠️ **Command timed out after 30 seconds.**");
             if (stdout) out.push(`**stdout:**\n\`\`\`\n${stdout}\n\`\`\``);
             if (stderr) out.push(`**stderr:**\n\`\`\`\n${stderr}\n\`\`\``);
             if (!stdout && !stderr) out.push("*(no output)*");
-            if (result.status !== 0) out.push(`**exit code:** ${result.status}`);
-            const text = out.join("\n");
-            const chunks = splitMessage(text, 1900);
+            if (result.status !== 0 && result.status !== null) out.push(`**exit code:** ${result.status}`);
+            const chunks = splitMessage(out.join("\n"), 1900);
             await message.reply(chunks[0]);
             for (let i = 1; i < chunks.length; i++) await message.channel.send(chunks[i]);
         } catch (err) {
@@ -142,28 +153,34 @@ async function handle(message, cmd, client) {
     }
 
     if (command === "models") {
-        const result = spawnSync("ollama", ["list"], { encoding: "utf8", timeout: 10000 });
-        const out = result.stdout?.trim() || "(no output)";
+        const result = await runAsync("ollama", ["list"], 10_000);
+        const out = stripAnsi(result.stdout || result.stderr || "(no output)");
         return message.reply(`**Ollama models:**\n\`\`\`\n${out}\n\`\`\``);
     }
 
     if (command === "model") {
-        const action = parts[1]?.toLowerCase();
+        const action    = parts[1]?.toLowerCase();
         const modelName = parts.slice(2).join(" ");
+
         if (action === "pull") {
             if (!modelName) return message.reply("Usage: `!model pull <name>`");
             console.log(`[OWNER] Pulling model: ${modelName}`);
-            await message.reply(`⏳ Pulling \`${modelName}\`... this may take a while.`);
-            const result = spawnSync("ollama", ["pull", modelName], { encoding: "utf8", timeout: 300000 });
-            const out = (result.stdout?.trim() || result.stderr?.trim() || "(no output)").slice(-1500);
+            await message.reply(`⏳ Pulling \`${modelName}\`… this may take a while. Other users can still chat.`);
+            const result = await runAsync("ollama", ["pull", modelName], 600_000);
+            if (result.timedOut) {
+                return message.channel.send(`⚠️ Pull timed out after 10 minutes for \`${modelName}\`.`);
+            }
+            const out = stripAnsi(result.stdout || result.stderr || "Done.").slice(-1500);
             return message.channel.send(`✅ Pull complete:\n\`\`\`\n${out}\n\`\`\``);
         }
+
         if (action === "rm") {
             if (!modelName) return message.reply("Usage: `!model rm <name>`");
-            const result = spawnSync("ollama", ["rm", modelName], { encoding: "utf8", timeout: 30000 });
-            const out = result.stdout?.trim() || result.stderr?.trim() || "Done.";
+            const result = await runAsync("ollama", ["rm", modelName], 30_000);
+            const out = stripAnsi(result.stdout || result.stderr || "Done.");
             return message.reply(`✅\n\`\`\`\n${out}\n\`\`\``);
         }
+
         return message.reply("Usage: `!model pull <name>` | `!model rm <name>`");
     }
 
@@ -194,10 +211,6 @@ async function handle(message, cmd, client) {
     }
 
     return message.reply(`Unknown command \`!${command}\`. Type \`!help\` for a list.`);
-}
-
-function register(client) {
-    // Exposed so messageTriggers can detect and intercept owner DM commands.
 }
 
 module.exports = { PREFIX, handle, isOwnerDmCommand: (message) => isOwner(message.author.id) };
