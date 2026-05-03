@@ -1,6 +1,7 @@
 const { ollamaChat }    = require("./ollamaClient");
 const { getSystemPrompt } = require("./systemPrompt");
 const { getContext, syncSystemPrompt } = require("../state/contexts");
+const { setChannelConfig }             = require("../state/config");
 const execTool       = require("../tools/exec");
 const searchTool     = require("../tools/search");
 const memoryTools    = require("../tools/memoryTools");
@@ -97,9 +98,9 @@ function splitMessage(text, size = 2000) {
 // Runs the conversation loop, dispatching tool_calls until the model produces
 // a plain content response (no tool_calls).
 // Returns { reply: string, thinking: string, memoriesInjected: bool }
-async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, client, userId, signal = null) {
+async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, client, userId, signal = null, disableThinkingFn = null) {
     let execAllowed = channelConfig.execEnabled;
-    const thinkingEnabled = channelConfig.thinkingEnabled ?? false;
+    let effectiveThinking = channelConfig.thinkingEnabled ?? false;
     const model = meta.model ?? process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 
     // Accumulate thinking across all iterations — show the reasoning behind the
@@ -112,17 +113,78 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
         const tools = buildToolDefinitions(channelConfig, execAllowed, userId);
         let response;
         try {
-            response = await ollamaChat({ model, messages, tools, thinkingEnabled, client, signal });
+            response = await ollamaChat({ model, messages, tools, thinkingEnabled: effectiveThinking, client, signal });
         } catch (err) {
-            // User (or owner/admin) killed the generation.
+            // ── Kill signal ───────────────────────────────────────────────────
             if (err.code === "ERR_CANCELED") {
+                messages.push({ role: "system", content: "Generation stopped: User interrupt." });
                 console.log("[AGENT] Generation aborted by kill signal.");
                 typing.stop();
                 return { reply: "⛔ Generation stopped.", thinking: accumulatedThinking, memoriesInjected: false };
             }
-            console.error(`[AGENT] Ollama error: ${err.message}`);
-            typing.stop();
-            return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
+
+            // ── Timeout ───────────────────────────────────────────────────────
+            if (err.code === "OLLAMA_TIMEOUT") {
+                messages.push({ role: "system", content: "Generation stopped: Timed out." });
+                console.log("[AGENT] Generation timed out.");
+                typing.stop();
+                return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
+            }
+
+            // ── Thinking unsupported — auto-disable and retry ─────────────────
+            if (err.code === "THINKING_UNSUPPORTED") {
+                effectiveThinking = false;
+                channelConfig.thinkingEnabled = false;
+                disableThinkingFn?.();
+                console.warn(`[AGENT] Thinking unsupported for ${model} — auto-disabled.`);
+                await replyFn(`⚠️ This model doesn't support thinking — automatically disabled for this channel.`);
+                try {
+                    response = await ollamaChat({ model, messages, tools, thinkingEnabled: false, client, signal });
+                } catch (e2) {
+                    if (e2.code === "ERR_CANCELED") {
+                        messages.push({ role: "system", content: "Generation stopped: User interrupt." });
+                        typing.stop();
+                        return { reply: "⛔ Generation stopped.", thinking: accumulatedThinking, memoriesInjected: false };
+                    }
+                    console.error(`[AGENT] Error after thinking retry: ${e2.message}`);
+                    typing.stop();
+                    return { reply: `❌ ${e2.message}`, thinking: "", memoriesInjected: false };
+                }
+            }
+
+            // ── 500 with images — strip images and retry ──────────────────────
+            else if (err.code === "OLLAMA_500") {
+                const imgEntry = [...messages.entries()].reverse().find(([, m]) => m.role === "user" && m.images?.length);
+                if (imgEntry) {
+                    const [imgIdx, imgMsg] = imgEntry;
+                    console.warn("[AGENT] Ollama 500 with images — retrying without images.");
+                    messages[imgIdx] = { ...imgMsg, content: imgMsg.content + "\n(Attached image not supported.)" };
+                    delete messages[imgIdx].images;
+                    try {
+                        response = await ollamaChat({ model, messages, tools, thinkingEnabled: effectiveThinking, client, signal });
+                    } catch (e2) {
+                        if (e2.code === "ERR_CANCELED") {
+                            messages.push({ role: "system", content: "Generation stopped: User interrupt." });
+                            typing.stop();
+                            return { reply: "⛔ Generation stopped.", thinking: accumulatedThinking, memoriesInjected: false };
+                        }
+                        console.error(`[AGENT] Error after image strip retry: ${e2.message}`);
+                        typing.stop();
+                        return { reply: `❌ ${e2.message}`, thinking: "", memoriesInjected: false };
+                    }
+                } else {
+                    console.error(`[AGENT] Ollama 500 (no images to strip): ${err.message}`);
+                    typing.stop();
+                    return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
+                }
+            }
+
+            // ── Generic error ─────────────────────────────────────────────────
+            else {
+                console.error(`[AGENT] Ollama error: ${err.message}`);
+                typing.stop();
+                return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
+            }
         }
 
         const { content, tool_calls, nativeThinking } = response;
@@ -170,7 +232,7 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
                 if (!execAllowed) {
                     toolResult = "Exec is disabled — command was not run.";
                 } else {
-                    const { result, isDenied } = await tool.exec(args, { replyFn, typing, messages, meta, client });
+                    const { result, isDenied } = await tool.exec(args, { replyFn, typing, messages, meta, client, signal });
                     if (isDenied) execAllowed = false;
                     toolResult = isDenied
                     ? `Denied: ${result}. Do not retry this command or suggest alternatives.`
@@ -209,10 +271,28 @@ async function handleTrigger(content, replyFn, typing, channelConfig, contextKey
     : { role: "user", content: `[${username}]: ${content}` };
     messages.push(userMsg);
 
-    const result = await runAgent(messages, replyFn, typing, channelConfig, sourceMeta, client, userId, signal);
+    // Build a callback that persists the thinking=false change to the right config scope.
+    const guildId = sourceMeta?.guildId ?? null;
+    const disableThinkingFn = () => {
+        if (contextKey.startsWith("channel:")) {
+            setChannelConfig(guildId, contextKey.slice(8), "thinkingEnabled", false);
+        } else if (contextKey.startsWith("dm:")) {
+            setChannelConfig(null, null, "thinkingEnabled", false, contextKey.slice(3), false);
+        } else if (contextKey.startsWith("gdm:")) {
+            setChannelConfig(null, contextKey.slice(4), "thinkingEnabled", false, null, true);
+        } else {
+            // guild: global scope — no channelId available here, in-memory only
+            console.log("[AGENT] Thinking disabled in-memory only (guild-scope context).");
+        }
+    };
+
+    const result = await runAgent(messages, replyFn, typing, channelConfig, sourceMeta, client, userId, signal, disableThinkingFn);
 
     // Flag memoriesInjected so callers can suppress the 🧠 button to protect privacy.
-    if (memoryBlock) result.memoriesInjected = true;
+    // In a one-on-one DM the user already knows their own memories, so the button
+    // is safe to show — only suppress it in guild/group contexts.
+    const isDm = contextKey.startsWith("dm:");
+    if (memoryBlock && !isDm) result.memoriesInjected = true;
     return result;
 }
 

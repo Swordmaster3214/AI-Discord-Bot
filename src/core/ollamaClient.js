@@ -1,11 +1,14 @@
 const axios = require("axios");
-const { config }                   = require("../state/config");
-const { unsupportedThinkingModels } = require("../state/contexts");
+const { config } = require("../state/config");
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 
 // Sends a chat request to Ollama using native tool calling.
-// Falls back on 400 only for unsupported thinking — tools are always sent.
+// Throws typed errors for callers to handle:
+//   THINKING_UNSUPPORTED — model rejected think:true (400)
+//   OLLAMA_500           — server-side error (500), caller may retry without images
+//   OLLAMA_TIMEOUT       — request timed out (ECONNABORTED)
+//   ERR_CANCELED         — aborted via signal, propagated immediately
 async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false, client, signal = null }) {
     const attemptRequest = async (useThinking, useTools) => {
         const body = {
@@ -29,7 +32,6 @@ async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false
         return { content: msg.content ?? "", tool_calls: msg.tool_calls ?? [], nativeThinking };
     };
 
-    // First attempt — full feature set
     try {
         return await attemptRequest(thinkingEnabled, tools);
     } catch (err) {
@@ -40,25 +42,25 @@ async function ollamaChat({ model, messages, tools = [], thinkingEnabled = false
             throw new Error("Ollama is not running. Start it with `ollama serve` and try again.");
         }
         if (err.code === "ECONNABORTED") {
-            throw new Error("Ollama timed out. The model may be taking too long to respond.");
+            const e = new Error("Ollama timed out. The model may be taking too long to respond.");
+            e.code = "OLLAMA_TIMEOUT";
+            throw e;
         }
 
-        // 400 with think:true — model does not support native thinking, retry without it
-        if (err.response?.status === 400 && thinkingEnabled && !unsupportedThinkingModels.has(model)) {
-            console.warn(`[OLLAMA] Model ${model} rejected think:true — retrying without it.`);
-            unsupportedThinkingModels.add(model);
-            if (client) {
-                try {
-                    const owner = await client.users.fetch(process.env.OWNER_ID);
-                    await owner.send(
-                        `⚠️ **Thinking not supported**\n` +
-                        `Model \`${model}\` returned a 400 when thinking was enabled.\n` +
-                        `The request was retried without thinking and succeeded.\n` +
-                        `Use \`/config thinking false\` or switch to a thinking-capable model.`
-                    );
-                } catch {}
-            }
-            return await attemptRequest(false, tools);
+        // 400 with think:true — surface to agentLoop to auto-disable and notify user.
+        if (err.response?.status === 400 && thinkingEnabled) {
+            console.warn(`[OLLAMA] Model ${model} rejected think:true — surfacing THINKING_UNSUPPORTED.`);
+            const e = new Error(`Model ${model} does not support thinking.`);
+            e.code = "THINKING_UNSUPPORTED";
+            e.model = model;
+            throw e;
+        }
+
+        // 500 — surface to agentLoop (may retry without images).
+        if (err.response?.status === 500) {
+            const e = new Error(`Ollama returned 500: ${err.response?.data?.error ?? err.message}`);
+            e.code = "OLLAMA_500";
+            throw e;
         }
 
         throw new Error(`Ollama error: ${err.message}`);

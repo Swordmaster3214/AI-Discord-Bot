@@ -1,4 +1,4 @@
-const { execSync }             = require("child_process");
+const { spawn }                = require("child_process");
 const { createPendingApproval, resolvePendingApproval } = require("../state/approvals");
 
 // Native Ollama tool definition
@@ -23,9 +23,44 @@ const definition = {
     },
 };
 
+// Runs command via spawn so it can be killed mid-execution via signal.
+// Returns the combined stdout+stderr output string.
+function runCommand(command, signal) {
+    return new Promise((resolve) => {
+        const proc = spawn("/bin/sh", ["-c", command]);
+        let output = "";
+
+        proc.stdout.on("data", d => { output += d.toString(); });
+        proc.stderr.on("data", d => { output += d.toString(); });
+
+        const onAbort = () => {
+            console.log(`[EXEC] Kill signal received — terminating child process.`);
+            proc.kill("SIGTERM");
+            // Give it a moment, then force kill.
+            setTimeout(() => proc.kill("SIGKILL"), 2000).unref();
+        };
+
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+        proc.on("close", (code) => {
+            if (signal) signal.removeEventListener("abort", onAbort);
+            if (signal?.aborted) {
+                resolve("Command killed: generation was stopped.");
+            } else {
+                resolve(output.trim() || `exit code ${code ?? "unknown"}`);
+            }
+        });
+
+        proc.on("error", (err) => {
+            if (signal) signal.removeEventListener("abort", onAbort);
+            resolve(`Command error: ${err.message}`);
+        });
+    });
+}
+
 // Executes the tool: requests approval, waits, runs or rejects.
-// Returns { output, isDenied } for the agent loop to add as a tool message.
-async function execute({ command }, { replyFn, typing, messages, meta, client }) {
+// Returns { result, isDenied } for the agent loop to add as a tool message.
+async function execute({ command }, { replyFn, typing, messages, meta, client, signal }) {
     console.log(`[EXEC] Requested: ${command}`);
     typing.stop();
 
@@ -37,34 +72,42 @@ async function execute({ command }, { replyFn, typing, messages, meta, client })
         client,
     );
 
+    // If the generation is killed while waiting for approval, auto-deny.
+    const onAbortWaiting = () => {
+        console.log(`[EXEC] Abort signal while awaiting approval — auto-denying ${id}.`);
+        resolvePendingApproval(id, { accepted: false, reason: "generation was killed" });
+    };
+    if (signal) signal.addEventListener("abort", onAbortWaiting, { once: true });
+
     await replyFn(
         `⚠️ Command requested:\n\`${command}\`\n` +
         `Use \`/approve decide\` with ID \`${id}\` to accept or deny.`
     );
 
     console.log(`[EXEC] Waiting for approval (id=${id})...`);
-    const result = await promise;
-    console.log(`[EXEC] Approval resolved (id=${id}): ${result}`);
+    const decision = await promise;
+    if (signal) signal.removeEventListener("abort", onAbortWaiting);
+    console.log(`[EXEC] Approval resolved (id=${id}):`, decision);
 
+    if (!decision.accepted) {
+        typing.restart();
+        return { result: `Denied: ${decision.reason}`, isDenied: true };
+    }
+
+    // Run the command — spawn so it's killable via signal.
+    console.log(`[EXEC] Running: ${command}`);
+    const output = await runCommand(command, signal);
     typing.restart();
-    return { result, isDenied: result.startsWith("Denied:") };
+    return { result: output, isDenied: false };
 }
 
 // Called by the /approve decide handler to resolve a pending request.
-function approve(id, decision, command, reason) {
-    let output;
-    if (decision === "deny") {
-        output = `Denied: ${reason}`;
-    } else {
-        try {
-            output = execSync(command).toString();
-            if (!output.trim()) output = "(no output)";
-        } catch (e) {
-            output = `Command failed: ${e.message}`;
-        }
-    }
-    resolvePendingApproval(id, output);
-    return output;
+// No longer runs the command itself — execution happens in execute() above.
+function approve(id, decision, _command, reason) {
+    resolvePendingApproval(id, decision === "accept"
+    ? { accepted: true }
+    : { accepted: false, reason: reason || "denied by owner" }
+    );
 }
 
 module.exports = { definition, execute, approve };
