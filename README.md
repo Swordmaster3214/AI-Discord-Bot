@@ -1,4 +1,4 @@
-# ai-discord-bot
+# AI-Discord-Bot
 
 An agentic Discord bot that runs on [Ollama](https://ollama.com) with native tool calling. Responds in channels, DMs, and threads. Supports web search via a local SearXNG instance, shell exec with owner approval, code execution, file access, page fetching, and persistent encrypted per-user memory.
 
