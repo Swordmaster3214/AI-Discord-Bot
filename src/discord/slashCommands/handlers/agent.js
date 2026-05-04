@@ -1,9 +1,8 @@
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
-const { getChannelConfig, getContextKey, resolveModel, config } = require("../../../state/config");
-const { isChannelAllowed }     = require("../../../state/permissions");
-const { readTextAttachments, readImageAttachments } = require("../../../tools/attachments");
-const { enqueue, splitMessage } = require("../../../core/queue");
-const { REASONING_BUTTON_ID, storeThinking } = require("../../../tools/chainSender");
+const { resolveConfig, isChannelOpen, getContextKey } = require("../../../state/config");
+const { readTextAttachments, readImageAttachments }   = require("../../../tools/attachments");
+const { enqueue, splitMessage }                       = require("../../../core/queue");
+const { REASONING_BUTTON_ID, storeThinking }          = require("../../../tools/chainSender");
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 
@@ -16,11 +15,13 @@ const builder = new SlashCommandBuilder()
 async function handle(interaction, ctx, client) {
     const { guildId, channelId, userId, isGroupDM, parentChannelId } = ctx;
 
-    if (!isChannelAllowed(guildId, channelId, userId, isGroupDM, parentChannelId)) {
+    if (!isChannelOpen(guildId, channelId, userId, isGroupDM, parentChannelId)) {
         return interaction.reply({ content: "The bot is not configured to respond in this channel.", flags: MessageFlags.Ephemeral });
     }
-    const channelConfig = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
-    if (channelConfig.mode === "none") {
+
+    const channelConfig = resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
+
+    if (channelConfig.settings.mode === "none") {
         return interaction.reply({ content: "The bot is not configured to respond in this channel.", flags: MessageFlags.Ephemeral });
     }
 
@@ -36,8 +37,8 @@ async function handle(interaction, ctx, client) {
     }
     const content = attachmentText ? `${prompt}\n\n${attachmentText}` : prompt;
 
-    const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM);
-    const resolvedModel = resolveModel(guildId, contextKey, DEFAULT_MODEL);
+    const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM, channelConfig.settings);
+    const resolvedModel = channelConfig.settings.model ?? DEFAULT_MODEL;
     const sourceMeta    = guildId
     ? { source: `${interaction.guild?.name ?? guildId} / <#${channelId}>`, guildId }
     : { source: `DM with ${interaction.user.username}` };

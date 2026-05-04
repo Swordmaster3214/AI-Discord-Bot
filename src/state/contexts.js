@@ -1,5 +1,5 @@
-const { getGuildConfig }  = require("./config");
-const { getSystemPrompt }  = require("../core/systemPrompt");
+const { config }          = require("./config");
+const { getSystemPrompt } = require("../core/systemPrompt");
 
 // In-memory conversation histories keyed by context key.
 const contexts = new Map();
@@ -23,9 +23,9 @@ function clearContext(key, channelConfig) {
 }
 
 function clearGuildContexts(guildId) {
-    const guild = getGuildConfig(guildId);
     contexts.delete(`guild:${guildId}`);
-    for (const channelId of Object.keys(guild.channels ?? {})) {
+    const channels = config.guilds[guildId]?.channels ?? {};
+    for (const channelId of Object.keys(channels)) {
         contexts.delete(`channel:${channelId}`);
     }
     console.log(`[CONTEXT] Cleared all contexts for guild ${guildId}.`);

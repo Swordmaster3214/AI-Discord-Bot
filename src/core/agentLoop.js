@@ -1,19 +1,17 @@
-const { ollamaChat }    = require("./ollamaClient");
-const { getSystemPrompt } = require("./systemPrompt");
+const { ollamaChat }      = require("./ollamaClient");
 const { getContext, syncSystemPrompt } = require("../state/contexts");
-const { setChannelConfig }             = require("../state/config");
-const execTool       = require("../tools/exec");
-const searchTool     = require("../tools/search");
-const memoryTools    = require("../tools/memoryTools");
-const memory         = require("../state/memory");
-const fileTool       = require("../tools/file");
-const runCodeTool    = require("../tools/runCode");
-const fetchTool      = require("../tools/fetch");
+const { setGuildValue, setDmValue }    = require("../state/config");
+const execTool    = require("../tools/exec");
+const searchTool  = require("../tools/search");
+const memoryTools = require("../tools/memoryTools");
+const memory      = require("../state/memory");
+const fileTool    = require("../tools/file");
+const runCodeTool = require("../tools/runCode");
+const fetchTool   = require("../tools/fetch");
 
 const MAX_ITERATIONS = 10;
 
 // ── Tool registry ─────────────────────────────────────────────────────────────
-// Add new tools here only. No other changes needed to support them.
 const TOOLS = {
     exec:       { def: execTool.definition,              exec: (args, ctx)        => execTool.execute(args, ctx) },
     search:     { def: searchTool.definition,            exec: (args)             => searchTool.execute(args) },
@@ -27,27 +25,26 @@ const TOOLS = {
 // Builds the tools array for Ollama based on channel config and memory opt-in.
 function buildToolDefinitions(channelConfig, execAllowed, userId) {
     const enabled = [];
-    if (execAllowed && channelConfig.execEnabled)                 enabled.push("exec");
-    if (channelConfig.browsingEnabled)                            enabled.push("search");
-    if (channelConfig.fileEnabled)                                enabled.push("file");
-    if (channelConfig.runCodeEnabled)                             enabled.push("run_code");
-    if (channelConfig.fetchEnabled)                               enabled.push("fetch_page");
+    const t = channelConfig.tools ?? {};
+    if (execAllowed && t.exec)                                    enabled.push("exec");
+    if (t.search)                                                 enabled.push("search");
+    if (t.file)                                                   enabled.push("file");
+    if (t.runCode)                                                enabled.push("run_code");
+    if (t.fetch)                                                  enabled.push("fetch_page");
     if (memory.ENABLED && userId && memory.isUserEnabled(userId)) enabled.push("remember", "forget");
     return enabled.map(k => TOOLS[k].def);
 }
 
 // Splits a string into Discord-safe chunks (≤2000 chars).
-// Priority: line boundary → word boundary → hard cut.
-// Tracks open fenced code blocks and closes/reopens them across chunk boundaries
-// so syntax highlighting and monospace rendering survive the split.
+// Tracks open fenced code blocks and closes/reopens them across boundaries.
 function splitMessage(text, size = 2000) {
     if (text.length <= size) return [text];
 
     const chunks  = [];
     const lines   = text.split("\n");
     let current   = "";
-    let inBlock   = false;   // inside a fenced code block?
-    let blockLang = "";      // opening fence language tag, e.g. "js"
+    let inBlock   = false;
+    let blockLang = "";
 
     const flush = () => {
         if (!current) return;
@@ -67,7 +64,6 @@ function splitMessage(text, size = 2000) {
 
         if (candidate.length <= size) { current = candidate; continue; }
 
-        // Candidate too long — flush, then handle line.
         flush();
 
         if (line.length <= size) {
@@ -75,7 +71,6 @@ function splitMessage(text, size = 2000) {
             continue;
         }
 
-        // Line itself too long — split at word boundaries.
         const words = line.split(" ");
         let buf = inBlock ? "```" + blockLang : "";
         for (const word of words) {
@@ -95,16 +90,11 @@ function splitMessage(text, size = 2000) {
 }
 
 // ── Agent loop ────────────────────────────────────────────────────────────────
-// Runs the conversation loop, dispatching tool_calls until the model produces
-// a plain content response (no tool_calls).
-// Returns { reply: string, thinking: string, memoriesInjected: bool }
 async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, client, userId, signal = null, disableThinkingFn = null) {
-    let execAllowed = channelConfig.execEnabled;
-    let effectiveThinking = channelConfig.thinkingEnabled ?? false;
+    let execAllowed       = channelConfig.tools?.exec     ?? false;
+    let effectiveThinking = channelConfig.tools?.thinking ?? false;
     const model = meta.model ?? process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 
-    // Accumulate thinking across all iterations — show the reasoning behind the
-    // final answer, not just the last iteration (tool-call turns can think too).
     let accumulatedThinking = "";
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
@@ -115,7 +105,6 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
         try {
             response = await ollamaChat({ model, messages, tools, thinkingEnabled: effectiveThinking, client, signal });
         } catch (err) {
-            // ── Kill signal ───────────────────────────────────────────────────
             if (err.code === "ERR_CANCELED") {
                 messages.push({ role: "system", content: "Generation stopped: User interrupt." });
                 console.log("[AGENT] Generation aborted by kill signal.");
@@ -123,7 +112,6 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
                 return { reply: "⛔ Generation stopped.", thinking: accumulatedThinking, memoriesInjected: false };
             }
 
-            // ── Timeout ───────────────────────────────────────────────────────
             if (err.code === "OLLAMA_TIMEOUT") {
                 messages.push({ role: "system", content: "Generation stopped: Timed out." });
                 console.log("[AGENT] Generation timed out.");
@@ -131,10 +119,9 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
                 return { reply: `❌ ${err.message}`, thinking: "", memoriesInjected: false };
             }
 
-            // ── Thinking unsupported — auto-disable and retry ─────────────────
             if (err.code === "THINKING_UNSUPPORTED") {
                 effectiveThinking = false;
-                channelConfig.thinkingEnabled = false;
+                channelConfig.tools.thinking = false;
                 disableThinkingFn?.();
                 console.warn(`[AGENT] Thinking unsupported for ${model} — auto-disabled.`);
                 await replyFn(`⚠️ This model doesn't support thinking — automatically disabled for this channel.`);
@@ -152,7 +139,6 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
                 }
             }
 
-            // ── 500 with images — strip images and retry ──────────────────────
             else if (err.code === "OLLAMA_500") {
                 const imgEntry = [...messages.entries()].reverse().find(([, m]) => m.role === "user" && m.images?.length);
                 if (imgEntry) {
@@ -179,7 +165,6 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
                 }
             }
 
-            // ── Generic error ─────────────────────────────────────────────────
             else {
                 console.error(`[AGENT] Ollama error: ${err.message}`);
                 typing.stop();
@@ -193,12 +178,10 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
             accumulatedThinking += (accumulatedThinking ? "\n\n---\n\n" : "") + nativeThinking;
         }
 
-        // Store assistant message in history.
         const assistantMsg = { role: "assistant", content: content ?? "" };
         if (nativeThinking) assistantMsg.thinking = nativeThinking;
         messages.push(assistantMsg);
 
-        // ── Natural termination: no tool_calls means the model is done ────────
         if (!tool_calls || tool_calls.length === 0) {
             const reply = content?.trim();
             if (!reply) {
@@ -211,7 +194,6 @@ async function runAgent(messages, replyFn, typing, channelConfig, meta = {}, cli
             return { reply, thinking: accumulatedThinking, memoriesInjected: false };
         }
 
-        // ── Tool dispatch ─────────────────────────────────────────────────────
         if (content?.trim()) await replyFn(content.trim());
 
         for (const call of tool_calls) {
@@ -257,9 +239,6 @@ async function handleTrigger(content, replyFn, typing, channelConfig, contextKey
     const messages = getContext(contextKey, channelConfig);
     syncSystemPrompt(contextKey, channelConfig);
 
-    // Inject per-user memories into the system prompt for this turn only.
-    // syncSystemPrompt already refreshed messages[0]; we append the memory block.
-    // The base system prompt is restored next turn by syncSystemPrompt.
     const memoryBlock = userId ? memory.buildMemoryBlock(userId) : "";
     if (memoryBlock) {
         messages[0] = { role: "system", content: messages[0].content + memoryBlock };
@@ -271,15 +250,15 @@ async function handleTrigger(content, replyFn, typing, channelConfig, contextKey
     : { role: "user", content: `[${username}]: ${content}` };
     messages.push(userMsg);
 
-    // Build a callback that persists the thinking=false change to the right config scope.
+    // Build a callback that persists thinking=false to the right config scope.
     const guildId = sourceMeta?.guildId ?? null;
     const disableThinkingFn = () => {
         if (contextKey.startsWith("channel:")) {
-            setChannelConfig(guildId, contextKey.slice(8), "thinkingEnabled", false);
+            setGuildValue(guildId, contextKey.slice(8), "tools", "thinking", false);
         } else if (contextKey.startsWith("dm:")) {
-            setChannelConfig(null, null, "thinkingEnabled", false, contextKey.slice(3), false);
+            setDmValue(contextKey.slice(3), false, null, "tools", "thinking", false);
         } else if (contextKey.startsWith("gdm:")) {
-            setChannelConfig(null, contextKey.slice(4), "thinkingEnabled", false, null, true);
+            setDmValue(null, true, contextKey.slice(4), "tools", "thinking", false);
         } else {
             // guild: global scope — no channelId available here, in-memory only
             console.log("[AGENT] Thinking disabled in-memory only (guild-scope context).");
@@ -288,9 +267,7 @@ async function handleTrigger(content, replyFn, typing, channelConfig, contextKey
 
     const result = await runAgent(messages, replyFn, typing, channelConfig, sourceMeta, client, userId, signal, disableThinkingFn);
 
-    // Flag memoriesInjected so callers can suppress the 🧠 button to protect privacy.
-    // In a one-on-one DM the user already knows their own memories, so the button
-    // is safe to show — only suppress it in guild/group contexts.
+    // Suppress 🧠 button in guild/group contexts when memories were injected.
     const isDm = contextKey.startsWith("dm:");
     if (memoryBlock && !isDm) result.memoriesInjected = true;
     return result;

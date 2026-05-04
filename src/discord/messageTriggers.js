@@ -1,10 +1,10 @@
-const { ChannelType }          = require("discord.js");
-const { getChannelConfig, getContextKey, resolveModel, config } = require("../state/config");
-const { isChannelAllowed, isOwner, getParentChannelId }         = require("../state/permissions");
-const { readTextAttachments, readImageAttachments }             = require("../tools/attachments");
-const { makeChainSender }      = require("../tools/chainSender");
-const { splitMessage, enqueue } = require("../core/queue");
-const ownerDm                  = require("./ownerDmCommands");
+const { ChannelType }                              = require("discord.js");
+const { resolveConfig, isChannelOpen, getContextKey } = require("../state/config");
+const { isOwner, getParentChannelId }               = require("../state/permissions");
+const { readTextAttachments, readImageAttachments } = require("../tools/attachments");
+const { makeChainSender }                           = require("../tools/chainSender");
+const { splitMessage, enqueue }                     = require("../core/queue");
+const ownerDm                                       = require("./ownerDmCommands");
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 
@@ -29,14 +29,14 @@ function register(client) {
         return ownerDm.handle(message, cmd, client);
             }
 
-            if (!isChannelAllowed(guildId, channelId, userId, isGroupDM, parentChannelId)) return;
+            if (!isChannelOpen(guildId, channelId, userId, isGroupDM, parentChannelId)) return;
 
-            const channelConfig = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
-        if (channelConfig.mode === "slash" || channelConfig.mode === "none") return;
+            const channelConfig = resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
+        if (channelConfig.settings.mode === "slash" || channelConfig.settings.mode === "none") return;
 
         const isMentioned = message.mentions.has(client.user) ||
         (message.reference?.messageId != null);
-        if (channelConfig.mode === "mention" && !isMentioned) return;
+        if (channelConfig.settings.mode === "mention" && !isMentioned) return;
 
         const baseContent = message.content.replace(/<@!?\d+>/, "").trim();
 
@@ -52,8 +52,8 @@ function register(client) {
         if (!content && attachmentImages.length === 0) return;
         const finalContent = content || "(Image attached — describe or analyse as appropriate.)";
 
-        const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM);
-        const resolvedModel = resolveModel(guildId, contextKey, DEFAULT_MODEL);
+        const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM, channelConfig.settings);
+        const resolvedModel = channelConfig.settings.model ?? DEFAULT_MODEL;
         const sourceMeta    = guildId
         ? { source: parentChannelId
             ? `${message.guild?.name ?? guildId} / <#${parentChannelId}> / thread <#${channelId}>`
@@ -73,12 +73,8 @@ function register(client) {
                 sourceMeta: { ...sourceMeta, model: resolvedModel, username: message.author.username },
                 client,
                 notifyFn:   (msg) => message.reply(msg),
-                          // replyFn is used for mid-step tool commentary — no reasoning button needed.
                           replyFn:    (msg) => chainSend(msg),
                           getChannel: async () => message.channel,
-                          // sendResult receives { reply, thinking, memoriesInjected } from the agent loop.
-                          // The first chunk gets the reasoning button (if any); subsequent chunks are plain.
-                          // 🧠 button is suppressed when memories were injected to protect user privacy.
                           sendResult: async ({ reply, thinking, memoriesInjected }) => {
                               const chunks = splitMessage(reply);
                               await sendFinal(chunks[0], thinking, memoriesInjected);

@@ -28,7 +28,7 @@ const activeContexts = new Set();
 const activeGenerations = new Map();
 
 async function enqueue(job) {
-    const key = job.contextKey;
+    const key     = job.contextKey;
     const userKey = job.userId ? `${job.userId}:${key}` : null;
 
     if (userKey && activeUserContexts.has(userKey)) {
@@ -56,7 +56,7 @@ async function processContext(key) {
     }
 
     activeContexts.add(key);
-    const job = queue.shift();
+    const job     = queue.shift();
     const userKey = job.userId ? `${job.userId}:${key}` : null;
     if (userKey) activeUserContexts.add(userKey);
 
@@ -64,7 +64,7 @@ async function processContext(key) {
 
     // DM exec consent notice — shown once per user per session when exec is enabled.
     const isDmContext = key.startsWith("dm:");
-    if (isDmContext && job.channelConfig.execEnabled && job.userId && !dmExecConsentSeen.has(job.userId)) {
+    if (isDmContext && job.channelConfig.tools?.exec && job.userId && !dmExecConsentSeen.has(job.userId)) {
         dmExecConsentSeen.add(job.userId);
         try {
             const channel = await job.getChannel();
@@ -72,14 +72,13 @@ async function processContext(key) {
                 `⚠️ **Heads up:** exec (shell commands) is enabled in this DM.\n` +
                 `If you ask the bot to run a command, an approval request will be sent to the bot owner — ` +
                 `this includes recent messages from our conversation as context for the decision.\n` +
-                `To disable exec, use \`/config exec false\`.`
+                `To disable exec, use \`/config tool exec false\`.`
             );
         } catch (err) {
             console.error(`[CONSENT] Could not send DM exec notice: ${err.message}`);
         }
     }
 
-    // Create an AbortController for this generation and register it.
     const controller = new AbortController();
     activeGenerations.set(key, {
         userId:    job.userId,
@@ -93,7 +92,6 @@ async function processContext(key) {
     const channel = await job.getChannel();
     const typing  = startTyping(channel);
     try {
-        // handleTrigger returns { reply, thinking, memoriesInjected }.
         const result = await handleTrigger(
             job.content, job.replyFn, typing, job.channelConfig,
             job.contextKey, job.username, job.sourceMeta ?? {},

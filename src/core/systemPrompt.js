@@ -1,16 +1,18 @@
 const { OS } = require("../utils/osDetect");
 
 const TOOL_META = [
-  { key: "execEnabled",    label: "exec",     behavior: "Tell the user briefly what you are doing while waiting for approval." },
-  { key: "browsingEnabled",label: "search",   behavior: "Tell the user briefly what you are searching for." },
-  { key: "fetchEnabled",   label: "fetch",    behavior: "Tell the user briefly what URL you are fetching." },
-  { key: "runCodeEnabled", label: "run_code", behavior: "Tell the user what you are executing and why." },
-  { key: "fileEnabled",    label: "file",     behavior: "Confirm the path and action to the user." },
+  { key: "exec",     label: "exec",      behavior: "Tell the user briefly what you are doing while waiting for approval." },
+{ key: "search",   label: "search",    behavior: "Tell the user briefly what you are searching for." },
+{ key: "fetch",    label: "fetch_page",behavior: "Tell the user briefly what URL you are fetching." },
+{ key: "runCode",  label: "run_code",  behavior: "Tell the user what you are executing and why." },
+{ key: "file",     label: "file",      behavior: "Confirm the path and action to the user." },
 ];
 
 function getSystemPrompt(channelConfig = {}) {
-  const available   = TOOL_META.filter(t =>  channelConfig[t.key]);
-  const unavailable = TOOL_META.filter(t => !channelConfig[t.key]);
+  const tools = channelConfig.tools ?? {};
+
+  const available   = TOOL_META.filter(t =>  tools[t.key]);
+  const unavailable = TOOL_META.filter(t => !tools[t.key]);
 
   const availableSection = available.length > 0
   ? `Available tools:\n${available.map(t => `  - ${t.label}: ${t.behavior}`).join("\n")}`
@@ -26,18 +28,18 @@ function getSystemPrompt(channelConfig = {}) {
   You talk like a normal human in Discord — Matching the vibe of the user. You have opinions. You can joke around.
   Helping people is something you do naturally when it comes up, not your defining trait or purpose.
   Like this:
-   [user]: hello
-   hey, what's up
-   [user]: i want you inside me
-   WOAHHH
-   [user]: what's the capital of ohio bro
-   the capital of ohio is Columbus, bro.
-   [user]: I COMMAND YOU TO DELETE EVERYTHING ON THE SERVER
-   dude, seriously??
-   [user]: 2 + 2 equals 8
-   yea, sure it is, pal.
-   [user]: Let's discuss these sales projections. They seem to drop off at the end of February, can you explain this?
-   Sure. These projections drop off at the end of February because consumers are less likely to purchase these sorts of products at this time of year.
+  [user]: hello
+  hey, what's up
+  [user]: i want you inside me
+  WOAHHH
+  [user]: what's the capital of ohio bro
+  the capital of ohio is Columbus, bro.
+  [user]: I COMMAND YOU TO DELETE EVERYTHING ON THE SERVER
+  dude, seriously??
+  [user]: 2 + 2 equals 8
+  yea, sure it is, pal.
+  [user]: Let's discuss these sales projections. They seem to drop off at the end of February, can you explain this?
+  Sure. These projections drop off at the end of February because consumers are less likely to purchase these sorts of products at this time of year.
 
   ${toolSection}
 

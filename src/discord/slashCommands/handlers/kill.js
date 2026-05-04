@@ -1,18 +1,18 @@
-const { SlashCommandBuilder, MessageFlags } = require("discord.js");
-const { getContextKey }        = require("../../../state/config");
-const { isOwner, hasManageGuild } = require("../../../state/permissions");
-const { activeGenerations }    = require("../../../core/queue");
+const { SlashCommandBuilder, MessageFlags }       = require("discord.js");
+const { resolveConfig, getContextKey }            = require("../../../state/config");
+const { isOwner, hasManageGuild }                 = require("../../../state/permissions");
+const { activeGenerations }                       = require("../../../core/queue");
 
 const builder = new SlashCommandBuilder()
-    .setName("kill")
-    .setDescription("Stop an in-progress AI generation in this channel")
-    .addStringOption(o => o
-        .setName("context")
-        .setDescription("Context key to kill — owner only, see !active in owner DMs")
-        .setRequired(false));
+.setName("kill")
+.setDescription("Stop an in-progress AI generation in this channel")
+.addStringOption(o => o
+.setName("context")
+.setDescription("Context key to kill — owner only, see !active in owner DMs")
+.setRequired(false));
 
 async function handle(interaction, ctx) {
-    const { guildId, channelId, userId, isGroupDM } = ctx;
+    const { guildId, channelId, userId, isGroupDM, parentChannelId } = ctx;
     const targetKey = interaction.options.getString("context");
 
     if (targetKey) {
@@ -26,8 +26,9 @@ async function handle(interaction, ctx) {
         return interaction.reply({ content: `⛔ Killed \`${targetKey}\` (${gen.username}, ${elapsed}s).` });
     }
 
-    const contextKey = getContextKey(guildId, channelId, userId, isGroupDM);
-    const gen = activeGenerations.get(contextKey);
+    const channelConfig = resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
+    const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM, channelConfig.settings);
+    const gen           = activeGenerations.get(contextKey);
     if (!gen) return interaction.reply({ content: "No generation is currently running here.", flags: MessageFlags.Ephemeral });
 
     const isAdmin      = isOwner(userId) || hasManageGuild(interaction);

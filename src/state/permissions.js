@@ -1,5 +1,7 @@
 const { ChannelType, PermissionFlagsBits } = require("discord.js");
-const { config, getGuildConfig }           = require("./config");
+const { DEFAULTS } = require("./config");
+
+// ── Role checks ───────────────────────────────────────────────────────────────
 
 function isOwner(userId) {
     return userId === process.env.OWNER_ID;
@@ -9,7 +11,53 @@ function hasManageGuild(interaction) {
     return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
 }
 
+// Checks whether interaction.user satisfies a policy role string.
+// "owner"    → only the bot owner
+// "admin"    → ManageGuild permission or owner
+// "everyone" → any user
+function satisfiesRole(interaction, role) {
+    switch (role ?? "admin") {
+        case "owner":    return isOwner(interaction.user.id);
+        case "everyone": return true;
+        default:         return isOwner(interaction.user.id) || hasManageGuild(interaction);
+    }
+}
+
+// ── Policy helpers ────────────────────────────────────────────────────────────
+//
+// All accept a fully-resolved config (from resolveConfig()) so they never need
+// to touch the raw config store or derive policy themselves.
+//
+// action = one of POLICY_KEYS: "configure" | "clearContext" | "gaslight" | "model"
+//
+function canPerform(interaction, action, resolvedConfig) {
+    const role = resolvedConfig?.policy?.[action] ?? DEFAULTS.policy[action];
+    return satisfiesRole(interaction, role);
+}
+
+function canConfigure(interaction, resolvedConfig) {
+    if (isOwner(interaction.user.id)) return true;
+    return canPerform(interaction, "configure", resolvedConfig);
+}
+
+function canClearContext(interaction, resolvedConfig) {
+    if (isOwner(interaction.user.id)) return true;
+    return canPerform(interaction, "clearContext", resolvedConfig);
+}
+
+function canGaslight(interaction, resolvedConfig) {
+    if (isOwner(interaction.user.id)) return true;
+    if (!interaction.guildId) return false; // DMs: owner-only regardless of policy
+    return canPerform(interaction, "gaslight", resolvedConfig);
+}
+
+function canChangeModel(interaction, resolvedConfig) {
+    if (isOwner(interaction.user.id)) return true;
+    return canPerform(interaction, "model", resolvedConfig);
+}
+
 // ── Thread detection ──────────────────────────────────────────────────────────
+
 const THREAD_TYPES = new Set([
     ChannelType.PublicThread,
     ChannelType.PrivateThread,
@@ -21,50 +69,15 @@ function getParentChannelId(channel) {
     return THREAD_TYPES.has(channel.type) ? (channel.parentId ?? null) : null;
 }
 
-// ── Channel access ────────────────────────────────────────────────────────────
-// Returns true if the bot should respond in this channel.
-// Guild channels: default-closed until at least one channel is configured.
-// DMs and group DMs: always open unless mode is explicitly "none".
-function isChannelAllowed(guildId, channelId, userId, isGroupDM, parentChannelId = null) {
-    if (!guildId) {
-        if (isGroupDM) {
-            const c = config.groupDms[channelId];
-            return !c || c.mode !== "none";
-        }
-        const c = config.dms[userId];
-        return !c || c.mode !== "none";
-    }
-    const guild = getGuildConfig(guildId);
-    const hasConfigured = Object.keys(guild.channels).length > 0;
-    if (hasConfigured) {
-        if (Object.prototype.hasOwnProperty.call(guild.channels, channelId)) return true;
-        if (parentChannelId && Object.prototype.hasOwnProperty.call(guild.channels, parentChannelId)) return true;
-        return false;
-    }
-    return false; // default-closed
-}
-
-// ── Context clear permission ──────────────────────────────────────────────────
-function canClearContext(interaction, guildId, channelId) {
-    if (isOwner(interaction.user.id)) return true;
-    if (!guildId) return true;
-    const guild = getGuildConfig(guildId);
-    const channelConf = guild.channels[channelId];
-    const effectivePerm = channelConf?.clearPermission ?? guild.clearPermission ?? "everyone";
-    return effectivePerm === "everyone" || hasManageGuild(interaction);
-}
-
-// ── Gaslight permission ───────────────────────────────────────────────────────
-function canGaslight(interaction, guildId) {
-    if (isOwner(interaction.user.id)) return true;
-    if (!guildId) return false; // DMs: owner only
-    const guild = getGuildConfig(guildId);
-    const effectivePerm = guild.gaslightPermission ?? "manager";
-    return effectivePerm === "everyone" || hasManageGuild(interaction);
-}
-
 module.exports = {
-    isOwner, hasManageGuild,
-    THREAD_TYPES, getParentChannelId,
-    isChannelAllowed, canClearContext, canGaslight,
+    isOwner,
+    hasManageGuild,
+    satisfiesRole,
+    canPerform,
+    canConfigure,
+    canClearContext,
+    canGaslight,
+    canChangeModel,
+    THREAD_TYPES,
+    getParentChannelId,
 };

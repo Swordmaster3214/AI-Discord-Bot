@@ -1,15 +1,15 @@
 const { SlashCommandBuilder, MessageFlags } = require("discord.js");
-const { getChannelConfig, getContextKey, getGuildConfig } = require("../../../state/config");
+const { resolveConfig, getContextKey }     = require("../../../state/config");
 const { clearContext, clearGuildContexts } = require("../../../state/contexts");
 const { isOwner, hasManageGuild, canClearContext } = require("../../../state/permissions");
 
 const builder = new SlashCommandBuilder()
-    .setName("clearcontext")
-    .setDescription("Clear the AI context for this location")
-    .addBooleanOption(o => o
-        .setName("all")
-        .setDescription("Clear all guild contexts (ManageServer or owner only)")
-        .setRequired(false));
+.setName("clearcontext")
+.setDescription("Clear the AI context for this location")
+.addBooleanOption(o => o
+.setName("all")
+.setDescription("Clear all guild contexts (ManageServer or owner only)")
+.setRequired(false));
 
 async function handle(interaction, ctx) {
     const { guildId, channelId, userId, isGroupDM, parentChannelId } = ctx;
@@ -24,13 +24,18 @@ async function handle(interaction, ctx) {
         return interaction.reply({ content: "✅ Cleared all contexts for this server." });
     }
 
-    if (!canClearContext(interaction, guildId, channelId)) {
+    const channelConfig = resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
+
+    if (!canClearContext(interaction, channelConfig)) {
         return interaction.reply({ content: "You don't have permission to clear context here.", flags: MessageFlags.Ephemeral });
     }
-    const channelConfig = getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId);
-    const contextKey    = getContextKey(guildId, channelId, userId, isGroupDM);
+
+    const contextKey = getContextKey(guildId, channelId, userId, isGroupDM, channelConfig.settings);
     clearContext(contextKey, channelConfig);
-    const scopeLabel = (guildId && getGuildConfig(guildId).contextScope === "global") ? "guild-wide" : "this channel's";
+
+    const scopeLabel = (guildId && channelConfig.settings.context === "guild")
+    ? "guild-wide"
+    : "this channel's";
     return interaction.reply({ content: `✅ Cleared ${scopeLabel} AI context.` });
 }
 

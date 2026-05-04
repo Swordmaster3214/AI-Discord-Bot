@@ -2,68 +2,77 @@ const fs = require("fs");
 
 const CONFIG_PATH = "./config.json";
 
-// Global defaults — these become fallbacks when no per-channel config exists.
-// terminationMode is kept for config compatibility but is not used by the native
-// tool calling agent loop; it remains meaningful only in schema-fallback mode.
-const defaultConfig = {
-    ollamaTimeout: 90000, // ms, 0 = no timeout
-    guilds:    {},
-    dms:       {},
-    groupDms:  {},
-    channelDefaults: {
-        mode:            "slash",
-        execEnabled:     false,
-        browsingEnabled: false,
-        thinkingEnabled: false,
-        fileEnabled:     false,
-        runCodeEnabled:  false,
-        fetchEnabled:    false,
+// ── Defaults (the base layer every resolved config starts from) ───────────────
+//
+// Three groups:
+//   settings — mode/model/context (the "what" of bot behaviour)
+//   tools    — which tools are enabled
+//   policy   — who may perform each action
+//              roles: "owner" | "admin" (ManageGuild or owner) | "everyone"
+//
+const DEFAULTS = {
+    settings: {
+        mode:    "slash",    // "slash" | "mention" | "auto" | "none"
+        model:   null,       // null = process.env.DEFAULT_MODEL
+        context: "channel",  // "channel" | "guild"  (guild contexts only)
     },
-    // guilds: { [guildId]: {
-    //   contextScope: "local"|"global",
-    //   clearPermission: "everyone"|"manager",
-    //   modelPermission: "everyone"|"manager",
-    //   model?: string,
-    //   channels: { [channelId]: {
-    //     mode, execEnabled, browsingEnabled, thinkingEnabled,
-    //     clearPermission?: "everyone"|"manager"
-    //   }}
-    // }}
-    // dms:      { [userId]:    { mode, execEnabled, browsingEnabled, thinkingEnabled, model? } }
-    // groupDms: { [channelId]: { mode, execEnabled, browsingEnabled, thinkingEnabled, model? } }
+    tools: {
+        exec:     false,
+        search:   false,
+        thinking: false,
+        file:     false,
+        runCode:  false,
+        fetch:    false,
+    },
+    policy: {
+        configure:    "admin",    // /config command
+        clearContext: "everyone", // /clearcontext
+        gaslight:     "admin",    // /gaslight
+        model:        "admin",    // /config model
+    },
 };
 
-function backfillChannelEntry(ch) {
-    const d = defaultConfig.channelDefaults;
-    if (!ch.mode)                       ch.mode            = d.mode;
-    if (ch.execEnabled     === undefined) ch.execEnabled     = d.execEnabled;
-    if (ch.browsingEnabled === undefined) ch.browsingEnabled = d.browsingEnabled;
-    if (ch.thinkingEnabled === undefined) ch.thinkingEnabled = d.thinkingEnabled;
-    if (ch.fileEnabled    === undefined) ch.fileEnabled    = d.fileEnabled;
-    if (ch.runCodeEnabled === undefined) ch.runCodeEnabled = d.runCodeEnabled;
-    if (ch.fetchEnabled   === undefined) ch.fetchEnabled   = d.fetchEnabled;
-}
+// Exported so callers can enumerate valid keys without hard-coding them.
+const TOOL_KEYS    = Object.keys(DEFAULTS.tools);
+const POLICY_KEYS  = Object.keys(DEFAULTS.policy);
+const SETTING_KEYS = Object.keys(DEFAULTS.settings);
 
+// ── Storage schema ─────────────────────────────────────────────────────────────
+//
+//  {
+//    ollamaTimeout: number,
+//    guilds: {
+//      [guildId]: {
+//        settings?: Partial<settings>,
+//        tools?:    Partial<tools>,
+//        policy?:   Partial<policy>,
+//        channels?: {
+//          [channelId]: {
+//            settings?: Partial<settings>,
+//            tools?:    Partial<tools>,
+//            policy?:   Partial<policy>,
+//          }
+//        }
+//      }
+//    },
+//    dms:      { [userId]:    { settings?, tools? } },
+//    groupDms: { [channelId]: { settings?, tools? } },
+//  }
+//
+// Only overrides are stored. Resolution (below) merges layers at read time.
+
+// ── Load / save ───────────────────────────────────────────────────────────────
 function loadConfig() {
     if (!fs.existsSync(CONFIG_PATH)) {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
+        const seed = { ollamaTimeout: 90_000, guilds: {}, dms: {}, groupDms: {} };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(seed, null, 2));
+        return seed;
     }
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH));
-    if (!cfg.guilds)                      cfg.guilds        = {};
-    if (!cfg.dms)                         cfg.dms           = {};
-    if (!cfg.groupDms)                    cfg.groupDms      = {};
-    if (cfg.ollamaTimeout === undefined)  cfg.ollamaTimeout = defaultConfig.ollamaTimeout;
-
-    for (const dm  of Object.values(cfg.dms))      backfillChannelEntry(dm);
-    for (const gdm of Object.values(cfg.groupDms)) backfillChannelEntry(gdm);
-    for (const guild of Object.values(cfg.guilds)) {
-        if (!guild.channels)         guild.channels        = {};
-        if (!guild.contextScope)     guild.contextScope    = "local";
-        if (!guild.clearPermission)     guild.clearPermission    = "everyone";
-        if (!guild.modelPermission)     guild.modelPermission    = "manager";
-        if (!guild.gaslightPermission)  guild.gaslightPermission = "manager";
-        for (const ch of Object.values(guild.channels)) backfillChannelEntry(ch);
-    }
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    if (!cfg.guilds)                     cfg.guilds      = {};
+    if (!cfg.dms)                        cfg.dms         = {};
+    if (!cfg.groupDms)                   cfg.groupDms    = {};
+    if (cfg.ollamaTimeout === undefined) cfg.ollamaTimeout = 90_000;
     return cfg;
 }
 
@@ -73,79 +82,148 @@ function saveConfig(cfg) {
 
 let config = loadConfig();
 
-// ── Guild config ──────────────────────────────────────────────────────────────
-function getGuildConfig(guildId) {
-    if (!config.guilds[guildId]) {
-        config.guilds[guildId] = {
-            contextScope: "local", clearPermission: "everyone",
-            modelPermission: "manager", gaslightPermission: "manager", channels: {},
-        };
+// ── Resolution ─────────────────────────────────────────────────────────────────
+//
+// Returns a fully-resolved config for a location by layering:
+//   DEFAULTS → guild → channel   (for guild channels / threads)
+//   DEFAULTS → dm/groupDm        (for direct messages)
+//
+// The returned object always has the complete shape of DEFAULTS; callers can
+// read any key without null-checking.
+//
+function resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId = null) {
+    const out = {
+        settings: { ...DEFAULTS.settings },
+        tools:    { ...DEFAULTS.tools    },
+        policy:   { ...DEFAULTS.policy   },
+    };
+
+    function applyLayer(layer) {
+        if (!layer) return;
+        if (layer.settings) Object.assign(out.settings, layer.settings);
+        if (layer.tools)    Object.assign(out.tools,    layer.tools);
+        if (layer.policy)   Object.assign(out.policy,   layer.policy);
     }
+
+    if (!guildId) {
+        const ns = isGroupDM ? config.groupDms : config.dms;
+        applyLayer(isGroupDM ? ns[channelId] : ns[userId]);
+        return out;
+    }
+
     const guild = config.guilds[guildId];
-    if (!guild.channels)             guild.channels          = {};
-    if (!guild.contextScope)         guild.contextScope      = "local";
-    if (!guild.clearPermission)      guild.clearPermission   = "everyone";
-    if (!guild.modelPermission)      guild.modelPermission   = "manager";
-    if (!guild.gaslightPermission)   guild.gaslightPermission = "manager";
-    return guild;
+    if (!guild) return out;
+
+    applyLayer(guild);
+
+    // Channel layer — exact match first, then parent (for threads)
+    applyLayer(guild.channels?.[channelId] ?? guild.channels?.[parentChannelId]);
+
+    return out;
 }
 
-// ── Channel / DM config ───────────────────────────────────────────────────────
-function getChannelConfig(guildId, channelId, userId, isGroupDM, parentChannelId = null) {
-    const defaults = { ...defaultConfig.channelDefaults };
-    if (!guildId) {
-        if (isGroupDM) {
-            if (!config.groupDms[channelId]) return defaults;
-            return Object.assign({}, defaults, config.groupDms[channelId]);
-        }
-        if (!config.dms[userId]) return defaults;
-        return Object.assign({}, defaults, config.dms[userId]);
-    }
-    const guild = getGuildConfig(guildId);
-    if (guild.channels[channelId])   return Object.assign({}, defaults, guild.channels[channelId]);
-    if (parentChannelId && guild.channels[parentChannelId])
-        return Object.assign({}, defaults, guild.channels[parentChannelId]);
-    return defaults;
-}
+// ── isChannelOpen ─────────────────────────────────────────────────────────────
+//
+// A guild channel is "open" when the guild has any config stored, OR when the
+// channel/thread itself has config. Without any config the bot stays silent —
+// default-closed semantics preserved.
+//
+// DMs are always open; mode checked after resolution.
+//
+function isChannelOpen(guildId, channelId, userId, isGroupDM, parentChannelId = null) {
+    if (!guildId) return true;
 
-function setChannelConfig(guildId, channelId, key, value, userId, isGroupDM) {
-    if (!guildId) {
-        if (isGroupDM) {
-            if (!config.groupDms[channelId]) config.groupDms[channelId] = { ...defaultConfig.channelDefaults };
-            config.groupDms[channelId][key] = value;
-        } else {
-            if (!config.dms[userId]) config.dms[userId] = { ...defaultConfig.channelDefaults };
-            config.dms[userId][key] = value;
-        }
-    } else {
-        const guild = getGuildConfig(guildId);
-        if (!guild.channels[channelId]) guild.channels[channelId] = { ...defaultConfig.channelDefaults };
-        guild.channels[channelId][key] = value;
-    }
-    saveConfig(config);
+    const guild = config.guilds[guildId];
+    if (!guild) return false;
+
+    const hasGuildLayer   = !!(guild.settings || guild.tools);
+    const hasChannelLayer = !!(guild.channels?.[channelId] ||
+    (parentChannelId && guild.channels?.[parentChannelId]));
+    return hasGuildLayer || hasChannelLayer;
 }
 
 // ── Context key ───────────────────────────────────────────────────────────────
-function getContextKey(guildId, channelId, userId, isGroupDM) {
-    if (!guildId) {
-        if (isGroupDM) return `gdm:${channelId}`;
-        return `dm:${userId}`;
-    }
-    const guild = getGuildConfig(guildId);
-    if (guild.contextScope === "global") return `guild:${guildId}`;
-    return `channel:${channelId}`;
+//
+// Pass the already-resolved settings (resolvedConfig.settings) to avoid
+// re-resolving. Falls back to "channel" scope if settings not provided.
+//
+function getContextKey(guildId, channelId, userId, isGroupDM, resolvedSettings = null) {
+    if (!guildId) return isGroupDM ? `gdm:${channelId}` : `dm:${userId}`;
+    const scope = resolvedSettings?.context ?? DEFAULTS.settings.context;
+    return scope === "guild" ? `guild:${guildId}` : `channel:${channelId}`;
 }
 
-// ── Model resolution ──────────────────────────────────────────────────────────
-// Resolves the active model for a conversation: guild/DM override, then global default.
-function resolveModel(guildId, contextKey, defaultModel) {
-    if (guildId) return config.guilds[guildId]?.model ?? defaultModel;
-    if (contextKey.startsWith("gdm:")) return config.groupDms[contextKey.slice(4)]?.model ?? defaultModel;
-    return config.dms[contextKey.slice(3)]?.model ?? defaultModel;
+// ── Mutation helpers ──────────────────────────────────────────────────────────
+//
+// group = "settings" | "tools" | "policy"
+// channelId = null  →  write to guild layer
+// channelId = id    →  write to channel layer inside the guild
+//
+function _ensureGuildChannel(guildId, channelId) {
+    if (!config.guilds[guildId])                       config.guilds[guildId]              = {};
+    if (!config.guilds[guildId].channels)              config.guilds[guildId].channels     = {};
+    if (!config.guilds[guildId].channels[channelId])   config.guilds[guildId].channels[channelId] = {};
+    return config.guilds[guildId].channels[channelId];
+}
+
+function _ensureGuild(guildId) {
+    if (!config.guilds[guildId]) config.guilds[guildId] = {};
+    return config.guilds[guildId];
+}
+
+function setGuildValue(guildId, channelId, group, key, value) {
+    const target = channelId
+    ? _ensureGuildChannel(guildId, channelId)
+    : _ensureGuild(guildId);
+    if (!target[group]) target[group] = {};
+    target[group][key] = value;
+    saveConfig(config);
+}
+
+function setDmValue(userId, isGroupDM, channelId, group, key, value) {
+    const ns = isGroupDM ? config.groupDms : config.dms;
+    const id = isGroupDM ? channelId : userId;
+    if (!ns[id])        ns[id]        = {};
+    if (!ns[id][group]) ns[id][group] = {};
+    ns[id][group][key] = value;
+    saveConfig(config);
+}
+
+// ── Reset helpers ─────────────────────────────────────────────────────────────
+//
+// Resetting removes stored overrides so the location reverts to inheriting
+// from its parent layer (channel → guild → defaults, guild → defaults).
+//
+function resetGuild(guildId) {
+    delete config.guilds[guildId];
+    saveConfig(config);
+}
+
+function resetChannel(guildId, channelId) {
+    if (config.guilds[guildId]?.channels) {
+        delete config.guilds[guildId].channels[channelId];
+        saveConfig(config);
+    }
+}
+
+function resetDm(userId, isGroupDM, channelId) {
+    const ns = isGroupDM ? config.groupDms : config.dms;
+    const id = isGroupDM ? channelId : userId;
+    delete ns[id];
+    saveConfig(config);
+}
+
+// ── Model resolution (shorthand) ──────────────────────────────────────────────
+function resolveModel(guildId, channelId, userId, isGroupDM, parentChannelId = null) {
+    return resolveConfig(guildId, channelId, userId, isGroupDM, parentChannelId)
+    .settings.model ?? process.env.DEFAULT_MODEL ?? "llama3.1:8b-instruct-q4_K_M";
 }
 
 module.exports = {
-    defaultConfig, config, loadConfig, saveConfig,
-    getGuildConfig, getChannelConfig, setChannelConfig,
-    getContextKey, resolveModel,
+    config, saveConfig, loadConfig,
+    DEFAULTS, TOOL_KEYS, POLICY_KEYS, SETTING_KEYS,
+    resolveConfig, isChannelOpen, getContextKey,
+    setGuildValue, setDmValue,
+    resetGuild, resetChannel, resetDm,
+    resolveModel,
 };
