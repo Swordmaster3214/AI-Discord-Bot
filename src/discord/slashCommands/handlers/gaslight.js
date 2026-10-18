@@ -24,7 +24,7 @@ async function handle(interaction, ctx) {
     messages.push({ role: "assistant", content });
     console.log(`[GASLIGHT] ${interaction.user.username} injected into ${contextKey}: "${content.slice(0, 80)}"`);
 
-    await interaction.reply({ content: `✅ Injected into context \`${contextKey}\`.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `✅ Injected into context \`${contextKey}\`.`});
 }
 
 module.exports = { name: "gaslight", builder, handle };

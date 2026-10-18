@@ -6,7 +6,7 @@ const {
     setGuildValue, setDmValue,
     resetGuild, resetChannel, resetDm,
 } = require("../../../state/config");
-const { clearGuildContexts, contexts } = require("../../../state/contexts");
+const { clearGuildContexts, contexts, getContext } = require("../../../state/contexts");
 const { isOwner, satisfiesRole, canConfigure } = require("../../../state/permissions");
 
 // ── Slash command definition ──────────────────────────────────────────────────

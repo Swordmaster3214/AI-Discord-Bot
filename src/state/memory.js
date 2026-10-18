@@ -11,6 +11,8 @@ const DB_PATH        = process.env.MEMORY_DB_PATH ?? "./memory.db";
 const MAX_MEMORIES   = 50;
 const ALGO           = "aes-256-gcm";
 const HASH_ALGO      = "sha256";
+const STALE_DAYS     = 30;
+const STALE_MS       = STALE_DAYS * 24 * 60 * 60 * 1000;
 
 // Feature is silently disabled when MEMORY_KEY is absent or malformed.
 const ENABLED = (() => {
@@ -48,9 +50,19 @@ function getDb() {
 
     CREATE TABLE IF NOT EXISTS memory_settings (
         user_hash    TEXT PRIMARY KEY,
-        enabled      INTEGER NOT NULL DEFAULT 0
+        enabled      INTEGER NOT NULL DEFAULT 0,
+        last_seen_at INTEGER
     );
     `);
+
+    // Safe migration for existing installs that don't have last_seen_at yet.
+    try {
+        db.exec(`ALTER TABLE memory_settings ADD COLUMN last_seen_at INTEGER`);
+        console.log("[MEMORY] Migrated memory_settings: added last_seen_at column.");
+    } catch {
+        // Column already exists, nothing to do.
+    }
+
     return db;
 }
 
@@ -102,6 +114,16 @@ function setUserEnabled(userId, value) {
     VALUES (?, ?)
     ON CONFLICT(user_hash) DO UPDATE SET enabled = excluded.enabled
     `).run(hash, value ? 1 : 0);
+}
+
+// Bumps last_seen_at for the user — called whenever memories are injected.
+// This is what keeps the 30-day staleness timer from firing on active users.
+function touchLastSeen(userId) {
+    if (!ENABLED) return;
+    const hash = hashUserId(userId);
+    getDb().prepare(
+        `UPDATE memory_settings SET last_seen_at = ? WHERE user_hash = ?`
+    ).run(Date.now(), hash);
 }
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -196,12 +218,76 @@ function clearMemories(userId) {
     return result.changes;
 }
 
+// ── Stale user pruning ────────────────────────────────────────────────────────
+// Removes memories (and their settings row) for users who haven't been seen
+// in STALE_DAYS days. Runs daily on startup; also exported for owner use.
+function pruneStaleUsers() {
+    if (!ENABLED) return 0;
+    const cutoff  = Date.now() - STALE_MS;
+    const database = getDb();
+
+    // last_seen_at NULL means the user opted in before we started tracking it.
+    // We treat NULL as "never seen" and consider them stale immediately only if
+    // they also have no memories — otherwise we give them a grace period of one
+    // more cycle (set last_seen_at to now so they get the full 30 days next time).
+    const nullRows = database.prepare(`
+    SELECT ms.user_hash
+    FROM memory_settings ms
+    LEFT JOIN memories m ON m.user_hash = ms.user_hash
+    WHERE ms.last_seen_at IS NULL AND m.user_hash IS NULL
+    `).all();
+    for (const { user_hash } of nullRows) {
+        database.prepare(`DELETE FROM memory_settings WHERE user_hash = ?`).run(user_hash);
+    }
+
+    // Stamp last_seen_at for users who have memories but no timestamp yet
+    // so they get a fresh 30-day window instead of being pruned immediately.
+    database.prepare(`
+    UPDATE memory_settings SET last_seen_at = ?
+    WHERE last_seen_at IS NULL
+    `).run(Date.now());
+
+    // Now prune anyone whose last_seen_at is past the cutoff.
+    const stale = database.prepare(`
+    SELECT user_hash FROM memory_settings WHERE last_seen_at < ?
+    `).all(cutoff);
+
+    let total = 0;
+    for (const { user_hash } of stale) {
+        const result = database.prepare(`DELETE FROM memories WHERE user_hash = ?`).run(user_hash);
+        database.prepare(`DELETE FROM memory_settings WHERE user_hash = ?`).run(user_hash);
+        total += result.changes;
+        if (result.changes > 0) {
+            console.log(`[MEMORY] Pruned ${result.changes} stale memories for ${user_hash.slice(0, 16)}… (inactive ${STALE_DAYS}+ days)`);
+        }
+    }
+
+    return total;
+}
+
+// Run once shortly after startup, then every 24 hours.
+if (ENABLED) {
+    setTimeout(() => {
+        const count = pruneStaleUsers();
+        if (count > 0) console.log(`[MEMORY] Startup prune: removed ${count} stale memories.`);
+    }, 10_000).unref();
+
+    setInterval(() => {
+        const count = pruneStaleUsers();
+        if (count > 0) console.log(`[MEMORY] Daily prune: removed ${count} stale memories.`);
+    }, 24 * 60 * 60 * 1000).unref();
+}
+
 // ── Injection builder ─────────────────────────────────────────────────────────
 // Formats memories as a system prompt block. Returns empty string if none.
 function buildMemoryBlock(userId) {
     if (!ENABLED || !isUserEnabled(userId)) return "";
     const memories = getMemories(userId);
     if (memories.length === 0) return "";
+
+    // User is actively chatting — reset their staleness timer.
+    touchLastSeen(userId);
+
     const lines = memories.map(m => {
         const date = new Date(m.created_at).toISOString().slice(0, 10);
         return `[#${m.id} | ${date}] ${m.fact}`;
@@ -221,10 +307,26 @@ function getStats() {
     if (!ENABLED) return { enabled: false };
     const database = getDb();
     const total    = database.prepare(`SELECT COUNT(*) as c FROM memories`).get().c;
+    const cutoff   = Date.now() - STALE_MS;
     const users    = database.prepare(
-        `SELECT user_hash, COUNT(*) as cnt FROM memories GROUP BY user_hash ORDER BY cnt DESC`
+        `SELECT user_hash, COUNT(*) as cnt, last_seen_at
+        FROM memories
+        JOIN memory_settings USING (user_hash)
+        GROUP BY user_hash
+        ORDER BY cnt DESC`
     ).all();
-    return { total, users };
+    // Tag users who are approaching the stale cutoff (within 7 days).
+    const warnMs = 7 * 24 * 60 * 60 * 1000;
+    return {
+        total,
+        staleInDays: STALE_DAYS,
+        users: users.map(u => ({
+            user_hash:    u.user_hash,
+            cnt:          u.cnt,
+            last_seen_at: u.last_seen_at,
+            nearlyStale:  u.last_seen_at !== null && u.last_seen_at < cutoff + warnMs,
+        })),
+    };
 }
 
 // Clears all memories for a given user_hash (hash already computed — owner uses hash from /memory list).
@@ -247,5 +349,6 @@ module.exports = {
     isUserEnabled, setUserEnabled,
     getMemories, addMemory, deleteMemory, updateMemory, clearMemories,
     buildMemoryBlock,
+    pruneStaleUsers,
     getStats, clearByHash, getUserHash,
 };
